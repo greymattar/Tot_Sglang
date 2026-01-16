@@ -1,0 +1,62 @@
+Traceback (most recent call last):
+  File "/lus/grand/projects/VeloC/atkia/tot_fastTree/env/py/lib/python3.10/runpy.py", line 187, in _run_module_as_main
+    mod_name, mod_spec, code = _get_module_details(mod_name, _Error)
+  File "/lus/grand/projects/VeloC/atkia/tot_fastTree/env/py/lib/python3.10/runpy.py", line 110, in _get_module_details
+    __import__(pkg_name)
+  File "/lus/grand/projects/VeloC/atkia/tot_fastTree/env/py/lib/python3.10/site-packages/sglang/__init__.py", line 5, in <module>
+    from sglang.lang.api import (
+  File "/lus/grand/projects/VeloC/atkia/tot_fastTree/env/py/lib/python3.10/site-packages/sglang/lang/api.py", line 7, in <module>
+    from sglang.lang.backend.base_backend import BaseBackend
+  File "/lus/grand/projects/VeloC/atkia/tot_fastTree/env/py/lib/python3.10/site-packages/sglang/lang/backend/base_backend.py", line 5, in <module>
+    from sglang.lang.interpreter import StreamExecutor
+  File "/lus/grand/projects/VeloC/atkia/tot_fastTree/env/py/lib/python3.10/site-packages/sglang/lang/interpreter.py", line 35, in <module>
+    from sglang.utils import (
+  File "/lus/grand/projects/VeloC/atkia/tot_fastTree/env/py/lib/python3.10/site-packages/sglang/utils.py", line 26, in <module>
+    from IPython.display import HTML, display
+  File "/lus/grand/projects/VeloC/atkia/tot_fastTree/env/py/lib/python3.10/site-packages/IPython/__init__.py", line 54, in <module>
+    from .core.application import Application
+  File "<frozen importlib._bootstrap>", line 1027, in _find_and_load
+  File "<frozen importlib._bootstrap>", line 1006, in _find_and_load_unlocked
+  File "<frozen importlib._bootstrap>", line 688, in _load_unlocked
+  File "<frozen importlib._bootstrap_external>", line 879, in exec_module
+  File "<frozen importlib._bootstrap_external>", line 975, in get_code
+  File "<frozen importlib._bootstrap_external>", line 1074, in get_data
+KeyboardInterrupt
+Traceback (most recent call last):
+  File "/lus/grand/projects/VeloC/atkia/tot_fastTree/env/py/lib/python3.10/runpy.py", line 196, in _run_module_as_main
+    return _run_code(code, main_globals, None,
+  File "/lus/grand/projects/VeloC/atkia/tot_fastTree/env/py/lib/python3.10/runpy.py", line 86, in _run_code
+    exec(code, run_globals)
+  File "/lus/grand/projects/VeloC/atkia/tot_fastTree/env/py/lib/python3.10/site-packages/sglang/launch_server.py", line 7, in <module>
+    from sglang.srt.server_args import prepare_server_args
+  File "/lus/grand/projects/VeloC/atkia/tot_fastTree/env/py/lib/python3.10/site-packages/sglang/srt/server_args.py", line 29, in <module>
+    from sglang.srt.connector import ConnectorType
+  File "/lus/grand/projects/VeloC/atkia/tot_fastTree/env/py/lib/python3.10/site-packages/sglang/srt/connector/__init__.py", line 6, in <module>
+    from sglang.srt.connector.base_connector import (
+  File "/lus/grand/projects/VeloC/atkia/tot_fastTree/env/py/lib/python3.10/site-packages/sglang/srt/connector/base_connector.py", line 10, in <module>
+    import torch
+  File "/lus/grand/projects/VeloC/atkia/tot_fastTree/env/py/lib/python3.10/site-packages/torch/__init__.py", line 2204, in <module>
+    from torch import (
+  File "/lus/grand/projects/VeloC/atkia/tot_fastTree/env/py/lib/python3.10/site-packages/torch/nested/__init__.py", line 21, in <module>
+    from ._internal.nested_tensor import _rebuild_njt, NestedTensor as _NestedTensor
+  File "/lus/grand/projects/VeloC/atkia/tot_fastTree/env/py/lib/python3.10/site-packages/torch/nested/_internal/nested_tensor.py", line 7, in <module>
+    from torch.nested._internal.nested_int import NestedIntNode
+  File "/lus/grand/projects/VeloC/atkia/tot_fastTree/env/py/lib/python3.10/site-packages/torch/nested/_internal/nested_int.py", line 4, in <module>
+    from torch.fx.experimental._constant_symnode import ConstantIntNode
+  File "/lus/grand/projects/VeloC/atkia/tot_fastTree/env/py/lib/python3.10/site-packages/torch/fx/__init__.py", line 88, in <module>
+    from torch.fx._symbolic_trace import (  # noqa: F401
+  File "/lus/grand/projects/VeloC/atkia/tot_fastTree/env/py/lib/python3.10/site-packages/torch/fx/_symbolic_trace.py", line 23, in <module>
+    from ._lazy_graph_module import _make_graph_module
+  File "/lus/grand/projects/VeloC/atkia/tot_fastTree/env/py/lib/python3.10/site-packages/torch/fx/_lazy_graph_module.py", line 4, in <module>
+    from torch.fx.graph_module import (
+  File "/lus/grand/projects/VeloC/atkia/tot_fastTree/env/py/lib/python3.10/site-packages/torch/fx/graph_module.py", line 20, in <module>
+    from .graph import (
+  File "/lus/grand/projects/VeloC/atkia/tot_fastTree/env/py/lib/python3.10/site-packages/torch/fx/graph.py", line 28, in <module>
+    from .node import _get_qualified_name, _type_repr, Argument, Node, Target
+  File "/lus/grand/projects/VeloC/atkia/tot_fastTree/env/py/lib/python3.10/site-packages/torch/fx/node.py", line 92, in <module>
+    _ops.aten._assert_async.msg,
+  File "/lus/grand/projects/VeloC/atkia/tot_fastTree/env/py/lib/python3.10/site-packages/torch/_ops.py", line 1363, in __getattr__
+    op, overload_names = _get_packet(qualified_op_name, module_name)
+  File "/lus/grand/projects/VeloC/atkia/tot_fastTree/env/py/lib/python3.10/site-packages/torch/_ops.py", line 1388, in _get_packet
+    op, overload_names = torch._C._jit_get_operation(qualname)
+KeyboardInterrupt

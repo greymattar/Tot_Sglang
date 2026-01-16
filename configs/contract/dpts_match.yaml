@@ -1,0 +1,58 @@
+seed: 12345
+
+dpts_config:
+  lambda_es: 0.8
+  lambda_ds: 0.8
+  t_star: 5
+
+  tree_width: 4
+  tree_depth: 16
+  num_branch : 4
+
+  max_new_tokens_global: 2048
+  max_new_tokens: 2048
+  max_rollout: 20
+  max_step_time_s: 120
+  max_step_time: 120
+  mini_step: true
+
+llm_config:
+  # match DPTS run
+  max_new_tokens_per_expand: 100
+  max_new_tokens: 100
+  do_sample: true
+  num_beams: 1
+  temperature: 1.0
+  top_p: 0.9
+
+prm_config: {}  
+dataset:
+  slice_path: "data/gsm8k_test_first50.jsonl"
+
+generator:
+  
+  model_id: "meta-llama/Llama-3.2-1B-Instruct"
+  dtype: "bfloat16"
+
+prm:
+  
+  model_id: "peiyi9979/math-shepherd-mistral-7b-prm"
+  prm_dtype: "float16"
+  step_tag: "ки"
+  good_token: "+"
+  bad_token: "-"
+  aggregation: "min"
+  tau: 0.90
+
+accounting:
+  # Standardized token accounting (oneacross backends)
+  include_prompt_tokens_in_total: false
+  count_prefill_as_generated: false
+  token_counting_method: "retokenize_delta"
+
+debug:
+    trace_dir: "runlogs/traces_smoke"
+    trace_problem_ids:
+      - "gsm8k_test_00000_2b2e3f9639f6fa28"
+      - "gsm8k_test_00001_de563650cee0d9af"
+      - "gsm8k_test_00002_d3c6224db7dd6691"

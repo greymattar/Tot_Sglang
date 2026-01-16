@@ -1,0 +1,43 @@
+# Filled in Step 2+. Committed to logs for every run.
+
+dataset:
+  name: "gsm8k"
+  split: "test"
+  first_n: 50
+  order: "deterministic"
+
+model:
+  hf_id: "<FILL_ME>"   # e.g., a 7B-ish model feasible on 1x A100
+  tokenizer: "<FILL_ME>"  # must match model exactly
+
+decoding:
+  temperature: 0.0
+  top_p: 1.0
+  max_new_tokens: 256
+
+search:
+  depth_D: 6
+  branch_B: 4
+  frontier_K: 16
+  stop_rule: "score>=tau OR depth_limit"
+  tau: 0.0  # placeholder
+
+accounting:
+  include_prompt_tokens: false
+  count_prefill_tokens: false
+  token_source: "tokenizer.encode"  # placeholder; we’ll standardize later
+
+seeds:
+  python: 1234
+  numpy: 1234
+  torch: 1234
+  backend: 1234
+
+
+debug:
+    trace_dir: "runlogs/traces_smoke"
+    trace_problem_ids:
+      - "gsm8k_test_00000_2b2e3f9639f6fa28"
+      - "gsm8k_test_00001_de563650cee0d9af"
+      - "gsm8k_test_00002_d3c6224db7dd6691"
+

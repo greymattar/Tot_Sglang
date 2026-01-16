@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+.env
+
+# Jupyter
+.ipynb_checkpoints/
+
+# HF / datasets / caches
+.cache/
+hf_cache/
+huggingface/
+datasets/
+transformers_cache/
+
+# Experiment outputs
+outputs/
+runs/
+wandb/
+logs/
+*.log
+
+# Model weights / checkpoints
+checkpoints/
+*.pt
+*.bin
+*.safetensors
+
+# Editor/OS
+.DS_Store
+.vscode/
+env/
