@@ -1,7 +1,11 @@
 # Python
 __pycache__/
-*.pyc
+*.py[cod]
 *.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
 .venv/
 venv/
 .env
@@ -9,27 +13,21 @@ venv/
 # Jupyter
 .ipynb_checkpoints/
 
-# HF / datasets / caches
-.cache/
-hf_cache/
-huggingface/
-datasets/
-transformers_cache/
-
-# Experiment outputs
-outputs/
-runs/
-wandb/
-logs/
+# Logs / outputs
 *.log
-
-# Model weights / checkpoints
+logs/
+runlogs/
+outputs/
+results/
 checkpoints/
-*.pt
-*.bin
-*.safetensors
+wandb/
+mlruns/
 
-# Editor/OS
+# Data (customize!)
+data/
+datasets/
+
+# OS/editor
 .DS_Store
 .vscode/
-env/
+.idea/

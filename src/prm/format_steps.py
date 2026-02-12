@@ -21,6 +21,16 @@ def to_step_tagged(text: str, step_tag: str = "ки") -> str:
     return "\n".join(out)
 
 def extract_final_answer_line(text: str) -> str:
-    # optional helper for GSM8K; keep it minimal
-    m = re.search(r"####\s*([-\d\.,]+)", text)
-    return m.group(0) if m else ""
+    if not text: return ""
+    
+    # 1. Try finding the standard "####" marker
+    # We capture everything (.+) until the end of the string
+    m = re.search(r"####\s*(.+)$", text, re.DOTALL)
+    if m:
+        return m.group(1).strip()
+    
+    # 2. Fallback: If no marker, maybe return the last non-empty line?
+    # (Optional, but risky for MATH. Safer to return "" if format isn't followed)
+    return ""
+
+

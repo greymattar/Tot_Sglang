@@ -10,8 +10,9 @@ from tot_harness.scorer_prm import PRMScorer
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--backend", choices=["hf", "sglang"], default="hf")
+    ap.add_argument("--backend", choices=["hf", "sglang", "vllm"], default="hf")
     ap.add_argument("--sgl_url", default="http://127.0.0.1:30000")
+    ap.add_argument("--vllm_url", default="http://127.0.0.1:18000")
     ap.add_argument("--n", type=int, default=3)
     ap.add_argument("--tag", type=str, default=None)
     args = ap.parse_args()
@@ -34,10 +35,13 @@ def main():
         backend = HFBackend(cfg["generator"]["model_id"],
                             dtype=cfg["generator"]["dtype"],
                             device="cuda:0")
-    else:
+    elif args.backend == "sglang":
         # SGLang backend (HTTP client)
         from src.backends.sglang_backend import SGLangBackend
         backend = SGLangBackend(args.sgl_url)
+    else:
+        from tot_harness.backend_vllm import VLLMBackend
+        backend = VLLMBackend(base_url=args.vllm_url, model=cfg["generator"]["model_id"])
 
     tc = TokenCounter(cfg["generator"]["model_id"])
 

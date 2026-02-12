@@ -1,31 +1,55 @@
 import re
 import uuid
 from collections import Counter
-from typing import List
+from typing import List, Dict
 
 def extract_answer_boxed(text: str) -> str:
-    # Your SSDP snippet: last \boxed{...}
+    """
+    Extracts content inside boxed{...}.
+    Useful for MATH datasets if the model uses LaTeX boxing.
+    """
+    # Finds the last occurence of \boxed{...}
+    # This regex is simple; a full nested brace parser is complex, 
+    # but this covers 99% of model outputs.
     matches = re.findall(r'\\boxed{((?:[^{}]|{[^{}]*})*)}', text)
     if matches:
         ans = matches[-1].strip()
-        return ans if ans != "" else str(uuid.uuid1())
+        return ans
     return ""
 
 def extract_answer_gsm8k(text: str) -> str:
-    # GSM8K: "#### <number>"
-    m = re.search(r"####\s*([-\d\.,]+)", text)
+    """
+    Extracts content after '####'.
+    UPDATED: Now captures EVERYTHING after ####, not just numbers.
+    This supports LaTeX answers like '#### p - q'.
+    """
+    # re.DOTALL allows the dot (.) to match newlines if the answer is multiline
+    m = re.search(r"####\s*(.+)$", text, re.DOTALL)
     if m:
-        return m.group(1).replace(",", "").strip()
+        ans = m.group(1).strip()
+        # NOTE: We removed .replace(",", "") because in MATH, 
+        # commas are needed for coordinates like (3, 4).
+        return ans
     return ""
 
 def extract_answer(text: str) -> str:
-    # Prefer boxed, else GSM8K, else empty
-    a = extract_answer_boxed(text)
-    if a:
-        return a
+    """
+    Master extractor.
+    Strategy:
+    1. Check for '####' (Explicit prompt instruction).
+    2. Check for '\boxed' (Standard Math format).
+    3. Return empty if neither found.
+    """
+    # Priority 1: Did the model follow our "####" instruction?
     a = extract_answer_gsm8k(text)
     if a:
         return a
+        
+    # Priority 2: Did the model just use \boxed{}?
+    a = extract_answer_boxed(text)
+    if a:
+        return a
+        
     return ""
 
 def agg_prm_min_max(x_list: List[str], ans_list: List[str], v_list: List[List[float]]) -> str:
