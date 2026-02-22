@@ -18,7 +18,7 @@ from transformers import AutoTokenizer
 
 from tot_harness.backend_vllm import VLLMBackend as VLLMBackend
 from tot_harness.batched_controller import run_batched_tot
-
+from tot_harness.voting import ALL_METHODS
 from tot_harness.scorer_prm import PRMScorer 
 
 
@@ -88,13 +88,19 @@ def main():
 
             "max_rollout": 20, # Safety limit
 
-            "max_step_time": 360,
+            "max_step_time": 480,
 
-            "max_new_tokens": 7168,
+            "max_new_tokens": 12000,
 
             "voting_method": "all",
 
-            "num_branch": raw_cfg.get("sampling", {}).get("n", 4)
+            "num_branch": raw_cfg.get("sampling", {}).get("n", 4),
+            "depth_bonus_mode": "until_first_candidate", "alpha_depth": 0.8, 
+            "priority_mode": "prm_nll_hybrid",
+            "nll_lambda": 0.1,
+            "nll_norm_mode": "welford_global",
+            "nll_token_filter_mode": "math_tokens",
+            "logprobs_required": True
 
         },
 
@@ -104,7 +110,7 @@ def main():
 
             "top_p": 0.9,
 
-            "max_new_tokens": 32,
+            "max_new_tokens": 100,
 
             **raw_cfg.get("generator", {}) # Override with yaml if present
 
@@ -169,15 +175,24 @@ def main():
     print(f"Detailed traces will be streamed to: {trace_file_path}")
 
     metrics_url = args.metrics_url or (args.vllm_url.rstrip("/") + "/metrics")
-
+    agg_path = os.path.join(out_dir, f"result_aggregated_{timestamp}.jsonl")
+    agg_f = open(agg_path, "w")
+    agg_stats = { m: {"total_samples": 0, "correct_samples": 0, "no_match_samples": 0} for m in ALL_METHODS }
     batch_metrics_path = os.path.join(out_dir, f"batch_metrics_{timestamp}.jsonl")
     batch_metrics_f = open(batch_metrics_path, "w")
     print(f"Batch metrics traces will be streamed to: {batch_metrics_path}")
     print(f"Using metrics URL: {metrics_url}")
 
+    
+    #Load Dataset
+    TARGET_IDS = [
+    "2","5","8","12","13","15","16","22","23","24","26","37","44","51","52",
+    "65","79","74","84","85","96","97","101","102","103","104","105","109",
+    "110","111","124","127","130","140","139","144","146","150","151","152",
+    "155","157","163","165","169","171","174","176","180","185"
+    ]
 
-    # Load Dataset
-
+    TARGET_SET = set(TARGET_IDS)
     slice_path = os.path.join(EXP_ROOT, cfg["dataset"]["slice_path"])
 
     problems = []
@@ -185,8 +200,10 @@ def main():
     with open(slice_path) as f:
 
         for line in f:
-
-            problems.append(json.loads(line))
+            #problems.append(json.loads(line))
+            obj = json.loads(line)
+            if obj.get("id") in TARGET_SET:
+                problems.append(obj)
 
 
     # RUN BATCHED SEARCH
@@ -212,6 +229,8 @@ def main():
         cfg=cfg,
 
         log_f=log_f, # Passing the file handle
+        agg_f=agg_f,
+        agg_stats=agg_stats,
 
         batch_problems=args.batch_problems,
         batch_metrics_f=batch_metrics_f,
@@ -225,7 +244,7 @@ def main():
 
     log_f.close()
     batch_metrics_f.close()
-
+    
 
     # --- SAVE FINAL SUMMARIES ---
 
@@ -247,7 +266,21 @@ def main():
 
             f.write(json.dumps(summary) + "\n")
 
-
+    
+    report = {}
+    for m in ALL_METHODS:
+        total = agg_stats[m]["total_samples"]
+        corr = agg_stats[m]["correct_samples"]
+        no_match = agg_stats[m]["no_match_samples"]
+        acc = (corr / total) if total else 0.0
+        report[m] = {
+                "accuracy": acc,
+                "total_samples": total,
+                "correct_samples": corr,
+                "no_match_samples": no_match,
+            }
+    print(json.dumps(report, indent=4))
+    agg_f.close()
     # Optional: Print simple stats to console
 
     correct = sum(1 for s in summaries if s.get("is_correct"))

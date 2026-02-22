@@ -1,0 +1,260 @@
+diff --git a/batched_controller.py b/batched_controller.py
+index 1111111..2222222 100644
+--- a/batched_controller.py
++++ b/batched_controller.py
+@@ -1,6 +1,7 @@
+ import heapq
+-
+ import time
++from enum import Enum
+ import math
+ import json
+ import logging
+@@ -52,6 +53,10 @@ class Node:
+     generated_tokens: int
+     created_at_iter: int = 0
+ 
++    # NOTE: effective priority is computed at PUSH time (children -> frontier),
++    # based on state knobs and candidate trigger state.
++
+ 
+ def _path_ids(nodes: Dict[str, Node], leaf_id: str) -> List[str]:
+     """Helper to trace back the path from leaf to root for token counting."""
+@@ -81,6 +86,20 @@ def normalize_math_str(s):
+         s = s.replace(" ", "").replace("\\left", "").replace("\\right", "").replace("\\boxed", "")
+         return s
+ 
++
++def _safe_mean(xs: List[float]) -> Optional[float]:
++    return (sum(xs) / len(xs)) if xs else None
++
++
+ class ProblemState:
+     """
+     Encapsulates the context of a single problem being solved.
+@@ -112,6 +131,45 @@ class ProblemState:
+         self.voting_method = dcfg.get("voting_method", "all")
+         self.max_candidates = int(dcfg.get("max_candidates", 5))
+ 
++        # -------------------------------
++        # Depth-bonus / trigger knobs
++        # -------------------------------
++        # A) alpha_depth (float)
++        self.alpha_depth = float(dcfg.get("alpha_depth", 0.0))
++        # B) depth_bonus_mode: "until_first_candidate" | "always_on" | "always_off"
++        self.depth_bonus_mode = str(dcfg.get("depth_bonus_mode", "always_off"))
++        # C) candidate_trigger_mode: only implement "non_empty_extract_answer" now
++        self.candidate_trigger_mode = str(dcfg.get("candidate_trigger_mode", "non_empty_extract_answer"))
++        # D) depth_bonus_cap (int or None)
++        cap = dcfg.get("depth_bonus_cap", None)
++        self.depth_bonus_cap = (int(cap) if cap is not None else None)
++        # E) tie_breaker: prefer deeper nodes when priorities equal AND candidates not found yet
++        self.tie_breaker = str(dcfg.get("tie_breaker", "prefer_deeper_until_candidate"))
++
++        # Trigger / instrumentation state
++        self.candidate_found_yet: bool = False
++        self.candidate_first_found_iter: Optional[int] = None
++        self.candidate_first_found_time: Optional[float] = None
++
++        # Per-iter instrumentation accumulators (set in get_parents_to_expand + expansion loop)
++        self._last_popped_parent_depths: List[int] = []
++        self._expanded_children_this_iter: int = 0
++
+ 
+         # State Initialization
+@@ -124,7 +182,8 @@ class ProblemState:
+ 
+         self.nodes: Dict[str, Node] = {}
+ 
+-        self.frontier = [] # Heapq of (-score, push_seq, node_id)
++        # Heapq of (priority_key, secondary_key, push_seq, node_id)
++        self.frontier = []
+ 
+         self.push_seq = 0
+ 
+         self.cand_ids: List[str] = []
+@@ -160,8 +219,69 @@ class ProblemState:
+         root = Node("root", None, 0, self.root_prompt, "", float("-inf"), [], 0,created_at_iter=0)
+ 
+         self.nodes[root.node_id] = root
+ 
+-        heapq.heappush(self.frontier, (float("-inf"), self.push_seq, "root"))
++        # Root has prm_score=-inf; give it "best" possible key so it pops first.
++        heapq.heappush(self.frontier, (float("-inf"), 0, self.push_seq, "root"))
+         self.push_seq += 1
+ 
+ 
++    def _candidate_trigger(self, child_completion: str) -> bool:
++        """
++        Modular trigger for 'turn off depth bonus'.
++        Implement only non_empty_extract_answer now; keep placeholder for future confidence signals.
++        """
++        mode = self.candidate_trigger_mode
++        if mode == "non_empty_extract_answer":
++            return bool(extract_answer(child_completion))
++        # Placeholder: "confidence_threshold" etc (not used yet)
++        return False
++
++
++    def _depth_bonus_active(self) -> bool:
++        if self.depth_bonus_mode == "always_off":
++            return False
++        if self.depth_bonus_mode == "always_on":
++            return True
++        # default / intended new behavior
++        if self.depth_bonus_mode == "until_first_candidate":
++            return (not self.candidate_found_yet)
++        # unknown mode -> safest fallback (baseline)
++        return False
++
++
++    def _depth_bonus_value(self, depth: int) -> float:
++        if not self._depth_bonus_active():
++            return 0.0
++        if self.alpha_depth == 0.0:
++            return 0.0
++        d = depth
++        if self.depth_bonus_cap is not None:
++            d = min(d, self.depth_bonus_cap)
++        return self.alpha_depth * float(d)
++
++
++    def frontier_item_for_node(self, node: Node):
++        """
++        Compute heap item for frontier push.
++        We want max effective_score, but heapq is min-heap -> store negative.
++        Applies depth bonus to CHILDREN at push time (as required).
++        """
++        effective_score = float(node.prm_score) + self._depth_bonus_value(node.depth)
++        priority_key = -effective_score
++
++        # Secondary / deterministic tie-break:
++        # When candidates not found yet, prefer deeper nodes on ties if enabled.
++        secondary_key = 0
++        if (not self.candidate_found_yet) and (self.tie_breaker == "prefer_deeper_until_candidate"):
++            secondary_key = -int(node.depth)
++
++        item = (priority_key, secondary_key, self.push_seq, node.node_id)
++        self.push_seq += 1
++        return item
++
++
+     def check_budgets(self) -> bool:
+         """Returns True if problem should stop."""
+         if self.finished: return True
+@@ -214,14 +334,16 @@ class ProblemState:
+         # Expand up to tree_width
+ 
+         for _ in range(self.tree_width):
+ 
+             if self.frontier:
+ 
+-                _, _, nid = heapq.heappop(self.frontier)
++                _, _, _, nid = heapq.heappop(self.frontier)
+ 
+                 parents_to_expand.append(self.nodes[nid])
+ 
+                 parent_ids_log.append(nid)
+ 
++        self._last_popped_parent_depths = [p.depth for p in parents_to_expand]
++        self._expanded_children_this_iter = 0
++
+ 
+         if not parents_to_expand:
+ 
+             return []
+@@ -239,6 +361,11 @@ class ProblemState:
+             "parents": parent_ids_log,
+ 
+             "frontier_len_before": len(self.frontier) + len(parents_to_expand),
+ 
+             "total_generated_tokens_so_far": self.total_generated_tokens,
++
++            # instrumentation snapshot (pre-expansion)
++            "candidate_found_yet": bool(self.candidate_found_yet),
++            "candidate_first_found_iter": self.candidate_first_found_iter,
+         }
+ 
+         self.log_f.write(json.dumps(log_entry) + "\n")
+@@ -420,7 +547,6 @@ def run_batched_tot(
+ 
+                     # Push to Frontier
+-
+-                    heapq.heappush(state.frontier, (-prm_score, state.push_seq, nid))
+-                    state.push_seq += 1
++                    heapq.heappush(state.frontier, state.frontier_item_for_node(new_node))
+ 
+-
+-                    # Candidate Check (Logic: extract_answer)
+-                    if extract_answer(child_text):
+-                        state.cand_ids.append(nid)
++                    # Candidate trigger + state transition instrumentation
++                    is_candidate = state._candidate_trigger(child_text)
++                    if is_candidate:
++                        state.cand_ids.append(nid)
++                        if not state.candidate_found_yet:
++                            state.candidate_found_yet = True
++                            state.candidate_first_found_iter = state.iter
++                            state.candidate_first_found_time = time.time()
++                            # log the transition ONCE
++                            state.log_f.write(json.dumps({
++                                "problem_id": state.id,
++                                "event": "candidate_first_found",
++                                "timestamp": state.candidate_first_found_time,
++                                "iter": state.candidate_first_found_iter,
++                                "node_id": nid,
++                                "depth": new_node.depth,
++                                "prm_score": prm_score,
++                                "num_candidates_total": len(state.cand_ids),
++                                "depth_bonus_mode": state.depth_bonus_mode,
++                                "alpha_depth": state.alpha_depth,
++                                "depth_bonus_cap": state.depth_bonus_cap,
++                                "candidate_trigger_mode": state.candidate_trigger_mode,
++                            }) + "\n")
+ 
++                    # per-iter expansion counter for instrumentation
++                    state._expanded_children_this_iter += 1
+ 
+                     # Log Expand
+                     staleness = state.iter - parent_node.created_at_iter
+@@ -447,6 +591,46 @@ def run_batched_tot(
+ 
+                     }) + "\n")
+ 
++            # Per-iteration / per-state summary instrumentation
++            # (logged once per state per iter if it participated in this batch step)
++            unique_states_touched = set(s for s, _ in request_map)
++            for s in unique_states_touched:
++                depths = list(s._last_popped_parent_depths) if hasattr(s, "_last_popped_parent_depths") else []
++                avg_d = _safe_mean([float(d) for d in depths]) if depths else None
++                max_d = int(max(depths)) if depths else None
++
++                s.log_f.write(json.dumps({
++                    "problem_id": s.id,
++                    "event": "iter_stats",
++                    "timestamp": time.time(),
++                    "iter": s.iter,
++                    "candidate_found_yet": bool(s.candidate_found_yet),
++                    "candidate_first_found_iter": s.candidate_first_found_iter,
++                    "avg_depth_of_popped_parents": avg_d,
++                    "max_depth_of_popped_parents": max_d,
++                    "number_of_nodes_expanded_this_iter": int(getattr(s, "_expanded_children_this_iter", 0)),
++                    "number_of_candidates_total": int(len(s.cand_ids)),
++                    "frontier_len_post": int(len(s.frontier)),
++                    "depth_bonus_mode": s.depth_bonus_mode,
++                    "alpha_depth": s.alpha_depth,
++                    "depth_bonus_cap": s.depth_bonus_cap,
++                }) + "\n")
++
+ 
+             # Increment Iterations for all touched states
+ 
+             # effectively incremented the 'iter' counter for every state that contributed prompts
+ 
+-    
+-
+-            unique_states_touched = set(s for s, _ in request_map)
+             for s in unique_states_touched:
+ 
+                 s.iter += 1
+
