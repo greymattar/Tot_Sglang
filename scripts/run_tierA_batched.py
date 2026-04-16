@@ -12,7 +12,7 @@ import torch
 import time
 
 from transformers import AutoTokenizer
-
+from src.prm.genprm_verifier import GenPRMVerifier
 
 #from tot_harness.backend_vllm import VLLMBackend
 
@@ -57,6 +57,8 @@ def main():
     parser.add_argument("--batch_width", type=int, default=4, help="Nodes per problem per step")
 
     parser.add_argument("--metrics_url", default=None, help="Prometheus /metrics endpoint (e.g. http://127.0.0.1:18000/metrics). ""If not set, will use --vllm_url + '/metrics'.")
+    parser.add_argument("--budget_new_tokens", type=int, default=12000,
+                    help="Override dpts_config.max_new_tokens for budget sweeps")
 
     args = parser.parse_args()
 
@@ -90,17 +92,45 @@ def main():
 
             "max_step_time": 480,
 
-            "max_new_tokens": 12000,
+            "max_new_tokens": int(args.budget_new_tokens) if args.budget_new_tokens is not None else 12000,
 
             "voting_method": "all",
 
             "num_branch": raw_cfg.get("sampling", {}).get("n", 4),
             "depth_bonus_mode": "until_first_candidate", "alpha_depth": 0.8, 
             "priority_mode": "prm_nll_hybrid",
-            "nll_lambda": 0.1,
+            "nll_lambda": 0.0,
             "nll_norm_mode": "welford_global",
             "nll_token_filter_mode": "math_tokens",
-            "logprobs_required": True
+            "logprobs_required": False,
+            "post_candidate_branch_width": 4,
+            "max_expansions_per_node": 20,
+            "post_candidate_sampling_enabled": False,
+            "post_candidate_sampling_top_m": 10,
+            "post_candidate_sampling_tau": 0.3,
+            "locality_penalty_enabled": False,
+            "locality_penalty_lambda": 0.3,
+            "locality_penalty_anchor_depth": 5,
+            "locality_penalty_recent_k": 1,
+            "depth_guardrail_enabled": False,
+            "depth_guardrail_delta": 3,
+            "depth_guardrail_use_first_candidate": False,
+            "adaptive_locality_enabled": True,
+            "adaptive_locality_top_m": 10,
+            "adaptive_locality_lambda_init": 0.2,
+            "adaptive_locality_lambda_min": 0.0,
+            "adaptive_locality_lambda_max": 1.0,
+            "adaptive_locality_eta_up": 0.1,
+            "adaptive_locality_eta_down": 0.05,
+            "adaptive_locality_overlap_target": 0.8,
+
+            "adaptive_depth_enabled": False,
+            "adaptive_depth_mu_init": 0.2,
+            "adaptive_depth_mu_min": 0.0,
+            "adaptive_depth_mu_max": 1.0,
+            "adaptive_depth_eta_up": 0.1,
+            "adaptive_depth_eta_down": 0.05,
+
 
         },
 
@@ -122,6 +152,11 @@ def main():
 
     }
 
+    print(f"[BUDGET] dpts_config.max_new_tokens={cfg['dpts_config']['max_new_tokens']}")
+
+    print(f"[top_m] dpts_config.max_new_tokens={cfg['dpts_config']['max_new_tokens']}")
+
+
 
     # Setup Backend (vLLM)
 
@@ -132,24 +167,35 @@ def main():
 
     prm_cfg = cfg["prm"]
 
+    prm_device = prm_cfg.get("device", "cuda:0")    
     scorer = PRMScorer(
+            prm_model_id=prm_cfg["model_id"],
+            device=prm_device,
+            prm_dtype=prm_cfg["prm_dtype"],
+            step_tag=prm_cfg["step_tag"],
+            good_token=prm_cfg["good_token"],
+            bad_token=prm_cfg["bad_token"],
+            aggregation="last", #tried with min also , try with mean next
+            mini_step=False,
+            #genprm_max_new_tokens=int(prm_cfg.get("genprm_max_new_tokens", 96)),
+            #genprm_temperature=float(prm_cfg.get("genprm_temperature", 0.0)),
+            #genprm_samples=int(prm_cfg.get("genprm_samples", 1)),
+        )
+    print(f"[PRM] backend={prm_cfg.get('backend')} model={prm_cfg['model_id']} Good Token={prm_cfg['good_token']}")
 
-        prm_cfg["model_id"],
-
-        device="cuda",
-
-        prm_dtype=prm_cfg["prm_dtype"],
-
-        step_tag=prm_cfg["step_tag"],
-
-        good_token=prm_cfg["good_token"],
-
-        bad_token=prm_cfg["bad_token"],
-
-        aggregation=prm_cfg["aggregation"],
-
-    )
-
+    verifier = None
+    vcfg = cfg["dpts_config"].get("verifier", {}) or {}
+    if vcfg.get("enabled", False):
+        v_device = vcfg.get("device", "cuda:1")
+        verifier = GenPRMVerifier(
+                model_id=vcfg["model_id"],
+                device=v_device,
+                dtype=vcfg.get("dtype", "bfloat16"),
+                
+            )
+        print(f"[VERIFIER] enabled model={vcfg['model_id']} samples_per_candidate={vcfg.get('samples_per_candidate', 3)}")
+    else:
+        print("[VERIFIER] disabled")
 
     # --- NEW: TOKEN COUNTER ---
 
@@ -200,10 +246,10 @@ def main():
     with open(slice_path) as f:
 
         for line in f:
-            #problems.append(json.loads(line))
-            obj = json.loads(line)
-            if obj.get("id") in TARGET_SET:
-                problems.append(obj)
+            problems.append(json.loads(line))
+            #obj = json.loads(line)
+            #if obj.get("id") in TARGET_SET:
+                #problems.append(obj)
 
 
     # RUN BATCHED SEARCH
@@ -235,6 +281,7 @@ def main():
         batch_problems=args.batch_problems,
         batch_metrics_f=batch_metrics_f,
         metrics_url=metrics_url,
+        verifier=verifier,
 
     )
 

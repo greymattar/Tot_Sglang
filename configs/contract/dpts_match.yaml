@@ -17,10 +17,32 @@ dpts_config:
   mini_step: true
   max_candidates: 10
   priority_mode: prm_nll_hybrid
-  nll_lambda: 0.3
+  nll_lambda: 0.0
   nll_norm_mode: welford_global
   nll_token_filter_mode: math_tokens
   logprobs_required: true
+
+
+  verifier:
+    enabled: false
+    model_id: "GenPRM/GenPRM-7B"
+    dtype: "bfloat16"
+    device: "cuda:1"
+    topk_groups: 6
+    reps_per_group: 2
+    alpha_vote: 0.5
+    samples_per_candidate: 5
+    max_new_tokens: 192
+    temperature: 0.7
+    top_p: 0.9
+
+  early_stop:
+    enabled: false
+    every_expansions: 50
+    tau_abs: 0.92
+    tau_margin: 0.08
+    streak: 2
+    min_unique_answers: 3
 
 llm_config:
   # match DPTS run
@@ -37,19 +59,19 @@ dataset:
 
 generator:
   
-  model_id: "meta-llama/Llama-3.1-8B-Instruct"
+  model_id: "meta-llama/Llama-3.2-3B-Instruct"
   dtype: "bfloat16"
 
 prm:
-  
+  backend: "math_shepherd"
   model_id: "peiyi9979/math-shepherd-mistral-7b-prm"
   prm_dtype: "float16"
+  device: "cuda:0"
   step_tag: "ки"
   good_token: "+"
   bad_token: "-"
   aggregation: "min"
   tau: 0.90
-
 accounting:
   # Standardized token accounting (oneacross backends)
   include_prompt_tokens_in_total: false

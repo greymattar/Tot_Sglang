@@ -32,7 +32,7 @@ class VLLMBackend:
             "model": self.model,
             "prompt": prompts, # <--- SENDING LIST HERE
             "max_tokens": int(sampling.get("max_new_tokens", 100)),
-            "temperature": float(sampling.get("temperature", 0.7)),
+            "temperature": float(sampling.get("temperature", 1.0)),
             "n": int(sampling.get("n", 1)),
         }
 

@@ -21,10 +21,12 @@ BAD_SUBSTRINGS += [
     "\\end{document}", "begin{document}",  # latex spill
 ]
 
-
-
 FINAL_CUE_RE = re.compile(
-    r"(<<FINAL>>|final\s+answer\s+is|therefore\s*,?\s*the\s+final\s+answer\s+is|answer\s*[:=]|\\boxed\{)",
+    r"(<<FINAL>>|<FINAL>|</FINAL>|"
+    r"final\s+answer\s*(?:is)?\s*[:=]?\s*|"
+    r"therefore\s*,?\s*the\s+final\s+answer\s*(?:is)?\s*[:=]?\s*|"
+    r"answer\s*[:=]\s*|"
+    r"\\boxed\{)",
     re.IGNORECASE | re.MULTILINE
 )
 
@@ -32,6 +34,148 @@ CUT_RE = re.compile(
     r"(####|</|<\||<s|</s|To\s*:|CC\s*:|Subject\s*:|##\s*Step|\\end\{document\}|\\begin\{document\})",
     re.IGNORECASE
 )
+
+ASSIGN_RE = re.compile(r"^[a-zA-Z]\w*=(.+)$")
+
+
+
+def strip_wrappers(s: str) -> str:
+    if s is None:
+        return ""
+    s = str(s).strip()
+
+    # remove surrounding math mode (possibly repeated)
+    s = s.strip()
+    while s.startswith("$") and s.endswith("$") and len(s) >= 2:
+        s = s[1:-1].strip()
+
+    # remove common latex wrappers
+    s = re.sub(r"\\boxed\{(.+)\}", r"\1", s)
+    s = re.sub(r"\\text\{(.+)\}", r"\1", s)
+    s = re.sub(r"\\mathrm\{(.+)\}", r"\1", s)
+
+    # normalize escaped dollar
+    s = s.replace("\\$", "$")
+
+    return s
+
+def normalize_degrees(s: str) -> str:
+    if not s:
+        return s
+
+    # Unicode degree -> LaTeX ^\circ
+    s = s.replace("°", r"^\circ")
+
+    # collapse variants of "\circ" into "^\circ"
+    s = re.sub(r"\\circ", r"^\\circ", s)                
+    s = re.sub(r"\^\{\s*\\circ\s*\}", r"^\\circ", s)    
+    s = re.sub(r"\^\s*\\circ", r"^\\circ", s)           
+
+    # remove spaces around ^
+    s = re.sub(r"\s*\^\s*", "^", s)
+    return s
+
+ASSIGN_RE = re.compile(r"^[a-zA-Z]\w*=(.+)$")
+
+def rhs_if_assignment(s: str) -> str:
+    m = ASSIGN_RE.match(s.replace(" ", ""))
+    return m.group(1) if m else ""
+
+def strip_currency(s: str) -> str:
+    if not s:
+        return s
+    s = s.strip()
+    # if it looks like currency (starts with $ and then number)
+    if re.match(r"^\$\s*[-+]?\d", s):
+        s = s[1:].strip()
+    return s
+DEG_RE = re.compile(r"^(.+?)(?:\^\\circ|°)$")
+
+def strip_degree_if_present(s: str) -> str:
+    m = DEG_RE.match(s)
+    return m.group(1) if m else s
+
+def parse_numeric_value(val: str):
+    val = regex.sub(",", "", str(val))
+    # strip trailing punctuation
+    val = regex.sub(r"[\.，,;:]+$", "", val)
+    try:
+        return float(val)
+    except:
+        pass
+    if val.endswith("%"):
+        v = val[:-1]
+        try:
+            return float(v) / 100.0
+        except:
+            return None
+    return None
+
+def normalize_math_str(s: str) -> str:
+    if s is None:
+        return ""
+
+    s = strip_wrappers(s)
+    s = strip_currency(s)
+    s = normalize_degrees(s)
+    s = str(s).strip()
+    rhs = rhs_if_assignment(s)
+    if rhs:
+        s = rhs
+
+    # strip math mode
+    s = s.strip("$")
+
+    # remove latex sizing wrappers
+    s = s.replace("\\left", "").replace("\\right", "").replace("\\,", "")
+    s = s.replace("\\!", "").replace("\\;", "").replace("\\:", "")
+
+    # normalize pi glyphs
+    s = s.replace("π", "\\pi")
+
+    # normalize \dfrac -> \frac
+    s = s.replace("\\dfrac", "\\frac")
+    s = s.replace("\\%", "%")
+
+    s0 = s.strip()
+    m = re.match(r"^([-+]?\d+(?:\.\d+)?)(?:\s*[a-zA-Z][a-zA-Z\s\/\-\^]*)$", s0)
+    if m:
+        s = m.group(1)
+
+    # remove whitespace
+    s = re.sub(r"\s+", "", s)
+    #remove trailing junk markers like "<"
+    s = re.sub(r"[<>]+$", "", s)
+    # remove trailing LaTeX/English punctuation
+    s = re.sub(r"[\.\s,;:]+$", "", s)
+
+    # strip wrapping punctuation/brackets if they are just wrappers
+    s = s.strip(" .;,:\n\t")
+    # normalize braces around simple tokens: {x} -> x (careful: this is mild)
+    s = re.sub(r"\{([a-zA-Z0-9\\]+)\}", r"\1", s)
+    # remove trailing punctuation
+    s = re.sub(r"[\.，,;:]+$", "", s)
+
+def _canon_key(ans: str) -> str:
+    """
+    Canonical key for voting/dedup.
+    - If answer looks like assignment (x=..., y=...), vote on RHS only.
+    - Otherwise vote on normalized math string.
+    """
+    if not ans:
+        return ""
+
+    a = ans.strip()
+
+
+    rhs = rhs_if_assignment(a)  # returns "" if not assignment
+    if rhs:
+        return normalize_math_str(rhs)
+    num = parse_numeric_value(a)  
+    if num is not None:
+        return normalize_math_str(num)
+
+    return normalize_math_str(a)
 
 
 def trim_trailing_junk(a: str) -> str:
@@ -46,7 +190,9 @@ HASH_RE = re.compile(r"####\s*(.+)$", re.MULTILINE)
 BOX_RE = reg.compile(r"\\boxed\{((?:[^{}]|(?R))*)\}")
 
 
-FINAL_TAG_RE = re.compile(r"(?is)<<FINAL>>\s*(.+?)\s*<</FINAL>>")
+FINAL_TAG_RE = re.compile(
+    r"(?is)(?:<<FINAL>>|<FINAL>)\s*(.+?)\s*(?:<</FINAL>>|</FINAL>)"
+)
 def _has_balanced_braces(s: str) -> bool:
     depth = 0
     for ch in s:
@@ -99,22 +245,40 @@ def extract_answer_final_tag(text: str) -> str:
     return ans
 
 
-def extract_answer_boxed(text: str) -> str:
-    """
-    Extracts content inside boxed{...}.
-    Useful for MATH datasets if the model uses LaTeX boxing.
-    """
-    # Finds the last occurence of \boxed{...}
-    # This regex is simple; a full nested brace parser is complex, 
-    # but this covers 99% of model outputs.
-    #matches = re.findall(r'\\boxed{((?:[^{}]|{[^{}]*})*)}', text)
-    tail = "\n".join(text.replace("\\n","\n").splitlines()[-8:])
-    matches = BOX_RE.findall(tail)
-    if matches:
-        ans = matches[-1].strip()
-        ans = trim_trailing_junk(ans)
-        return ans
+
+
+def _extract_last_boxed_balanced(text: str) -> str:
+    t = text.replace("\\n", "\n")
+    tail = "\n".join(t.splitlines()[-12:])   # a bit larger tail is safer
+
+    key = r"\boxed{"
+    start = tail.rfind(key)
+    if start == -1:
+        return ""
+
+    i = start + len(key)
+    depth = 1
+    buf = []
+
+    while i < len(tail):
+        ch = tail[i]
+        if ch == "{":
+            depth += 1
+            buf.append(ch)
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                ans = "".join(buf).strip()
+                return trim_trailing_junk(ans)
+            buf.append(ch)
+        else:
+            buf.append(ch)
+        i += 1
+
     return ""
+
+def extract_answer_boxed(text: str) -> str:
+    return _extract_last_boxed_balanced(text)
 
 def extract_answer_gsm8k(text: str) -> str:
     """
@@ -189,18 +353,31 @@ def agg_prm_last_max(x_list: List[str], ans_list: List[str], v_list: List[List[f
     return x_list[vals.index(max(vals))]
 
 def agg_majority_vote(x_list: List[str], ans_list: List[str], v_list: List[List[float]]) -> str:
-    valid = [a for a in ans_list if a]
-    if not valid:
+    # Build (idx, raw_ans, canon_ans) for valid answers
+    triples = []
+    for i, a in enumerate(ans_list):
+        if not a:
+            continue
+        canon = _canon_key(a)
+        if not canon:
+            continue
+        triples.append((i, a, canon))
+
+    if not triples:
         # fallback to last_max like SSDP snippet
         return agg_prm_last_max(x_list, ans_list, v_list)
 
-    counts = Counter(valid)
-    most_common = max(counts, key=counts.get)
+    counts = Counter(canon for _, _, canon in triples)
+    winner_canon = counts.most_common(1)[0][0]
 
-    for ans, text in zip(ans_list, x_list):
-        if ans == most_common:
-            return text
-    return x_list[0]
+    # Return the candidate TEXT corresponding to the winning canon key
+    for i, raw, canon in triples:
+        if canon == winner_canon:
+            return x_list[i]
+
+    # should never hit, but safe fallback
+    return x_list[triples[0][0]]
+
 
 def aggregate(voting_method: str, x_list: List[str], v_list: List[List[float]]) -> str:
     ans_list = [extract_answer(x) for x in x_list]
@@ -251,6 +428,7 @@ def agg_prm_last_vote(x_list: List[str], ans_list: List[str], v_list: List[List[
 
 def aggregate_one(method: str, x_list: List[str], v_list: List[List[float]]) -> str:
     ans_list = [extract_answer(x) for x in x_list]
+
 
     if method in ("majority_vote",):
         return agg_majority_vote(x_list, ans_list, v_list)
