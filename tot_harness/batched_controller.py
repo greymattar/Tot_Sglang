@@ -5,7 +5,7 @@ import time
 import math
 
 import json
-
+import numpy as np
 import logging
 
 import time,os
@@ -13,9 +13,13 @@ import re
 import regex as reg
 from dataclasses import dataclass, field
 
+import regex
+from math import isclose
+from sympy import simplify, N
+from sympy.parsing.latex import parse_latex
 from typing import List, Dict, Any, Optional
 from tot_harness.grading.robust_grader import extract_final_answer, math_equal, clean_latex
-
+from tot_harness.backend_vllm import GenResult
 from tot_harness.nll_priority import NLLPriorityHelper
 from statistics import mean
 from tot_harness.vllm_metrics import VLLMMetrics, get_hist_delta, get_counter_delta, get_gauge, safe_mean
@@ -38,10 +42,36 @@ def extract_final_answer_strict(text: str) -> str:
     return ""
 
 
-import regex
-from math import isclose
-from sympy import simplify, N
-from sympy.parsing.latex import parse_latex
+
+def _normalize_top_level_frac(s: str) -> str:
+    # If there's a top-level '/' (depth 0), strip one outer layer of parentheses
+    depth = 0
+    for i, ch in enumerate(s):
+        if ch == '(':
+            depth += 1
+        elif ch == ')':
+            depth -= 1
+        elif ch == '/' and depth == 0:
+            left, right = s[:i].strip(), s[i+1:].strip()
+            def strip_one_layer(x):
+                if x.startswith('(') and x.endswith(')'):
+                    inner = x[1:-1]
+                    d = 0
+                    for c in inner:
+                        if c == '(':
+                            d += 1
+                        elif c == ')':
+                            d -= 1
+                            if d < 0:
+                                return x
+                    if d == 0:
+                        return inner.strip()
+                return x
+            left = strip_one_layer(left)
+            right = strip_one_layer(right)
+            return f"{left}/{right}"
+    return s
+
 
 PAIR_RE = regex.compile(r"^\((.+),(.+)\)$")  # after normalization, no spaces
 def parse_numeric_value(val: str):
@@ -132,7 +162,7 @@ def normalize_degrees(s: str) -> str:
     s = s.replace("°", r"^\circ")
 
     # collapse variants of "\circ" into "^\circ"
-    s = re.sub(r"\\circ", r"^\\circ", s)                
+    s = re.sub(r'(?<!\^)\\circ', r'^\\circ', s)            
     s = re.sub(r"\^\{\s*\\circ\s*\}", r"^\\circ", s)    
     s = re.sub(r"\^\s*\\circ", r"^\\circ", s)           
 
@@ -268,6 +298,178 @@ def normalize_math_str(s: str) -> str:
     s = s.replace("\\dfrac", "\\frac")
     s = s.replace("\\%", "%")
 
+        # --- canonicalization fixes (paste here) ---
+    # unescape JSON-double-escaped backslashes -> turn "\\frac" into "\frac"
+    s = s.replace('\\\\\\\\', '\\\\')
+    
+    # handle \frac forms (braced and space-separated) BEFORE removing braces
+    # braced form: \frac{a}{b} -> (a)/(b)
+    s = re.sub(r'\\\\frac\s*\{\s*([^}]+?)\s*\}\s*\{\s*([^}]+?)\s*\}', r'(\1)/(\2)', s)
+    # unbraced form: \frac a b -> (a)/(b)
+    s = re.sub(r'\\\\frac\s+([^\s\{]+)\s+([^\s\{]+)', r'(\1)/(\2)', s)
+    
+    # convert \sqrt{...} -> sqrt(...)
+    s = re.sub(r'\\\\sqrt\s*\{\s*([^}]+?)\s*\}', r'sqrt(\1)', s)
+    
+    # convert pmatrix/matrix -> tuple-like "(a,b,...)"
+    s = s.replace('\\begin{pmatrix}', '(').replace('\\end{pmatrix}', ')')
+    s = s.replace('\\begin{matrix}', '(').replace('\\end{matrix}', ')')
+    # LaTeX row sep "\\\\" -> comma (do this after begin/end replacement)
+    s = s.replace('\\\\\\\\', ',')
+    
+    # normalize pi glyphs and LaTeX \pi -> plain pi
+    s = s.replace('\\\\pi', 'pi')
+    s = s.replace('π', 'pi')
+    
+    # remove \text{...} wrappers (keep inner content)
+    s = re.sub(r'\\\\text\{([^}]+)\}', r'\1', s)
+    
+    # strip common trailing 'degrees' words (they will be compared degree-insensitively)
+    s = re.sub(r'\bdegrees?\b', '', s, flags=re.IGNORECASE)
+    # --- end canonicalization fixes ---
+
+    # unescape double-backslashes that often appear when reading JSON-escaped LaTeX
+    s = s.replace('\\\\', '\\')
+
+    # convert simple LaTeX fractions like \frac{a}{b} -> a/b
+    s = re.sub(r"\\frac\{\s*(-?\d+)\s*\}\{\s*(-?\d+)\s*\}", r"\1/\2", s)
+
+    # convert \sqrt{...} -> sqrt(...)
+    s = re.sub(r"\\sqrt\{([^}]+)\}", r"sqrt(\1)", s)
+
+        # ensure implied multiplication like '3sqrt(3)' or '3(2+1)' becomes '3*sqrt(3)' / '3*(2+1)'
+    s = re.sub(r'(?<=\d)\s*(?=sqrt\b)', '*', s)
+    s = re.sub(r'(?<=\d)\s*(?=\()', '*', s)
+    
+    # restore caret-backslash for circ if earlier cleanup removed the backslash
+    #s = s.replace('^circ', '^\\\\circ')
+
+
+    # ensure sqrt tokens always have parentheses: sqrt3 -> sqrt(3), sqrt( 3 ) -> sqrt(3)
+    s = re.sub(r'sqrt\s*\(?\s*([^\s(),/]+)\s*\)?', r'sqrt(\1)', s)
+
+    # canonicalize top-level (num)/(den) -> num/den preserving nested parentheses
+    s = _normalize_top_level_frac(s)
+
+    # collapse cases like ')/(' -> '/'
+    s = re.sub(r'\)\s*/\s*\(', '/', s)
+
+    # normalize LaTeX \pi -> plain pi
+    s = s.replace('\\pi', 'pi')
+
+        # ---- canonicalization additions (paste here) ----
+    # unescape JSON-double-escaped backslashes -> "\frac" from "\\frac"
+    s = s.replace('\\\\\\\\', '\\\\')
+    
+    # normalize escaped paren wrappers
+    s = s.replace('\\(', '(').replace('\\)', ')')
+    
+    # remove common \left/\right already handled, ensure stray ones removed
+    s = s.replace('\\left', '').replace('\\right', '')
+    
+    # convert \frac{a}{b} and \frac a b -> (a)/(b)
+    s = re.sub(r'\\\\frac\s*\{\s*([^}]+?)\s*\}\s*\{\s*([^}]+?)\s*\}', r'(\1)/(\2)', s)
+    s = re.sub(r'\\\\frac\s+([^\s\{]+)\s+([^\s\{]+)', r'(\1)/(\2)', s)
+    
+    # convert \sqrt{...} -> sqrt(...)
+    s = re.sub(r'\\\\sqrt\s*\{\s*([^}]+?)\s*\}', r'sqrt(\1)', s)
+    
+    # normalize pi glyphs and LaTeX \pi -> pi
+    s = s.replace('\\\\pi', 'pi')
+    s = s.replace('π', 'pi')
+    
+    # convert pmatrix/matrix to tuple-like: \begin{pmatrix} a \\ b \\ c \end{pmatrix} -> (a,b,c)
+    s = s.replace('\\begin{pmatrix}', '(').replace('\\end{pmatrix}', ')')
+    s = s.replace('\\begin{matrix}', '(').replace('\\end{matrix}', ')')
+    s = s.replace('\\\\\\\\', ',')  # LaTeX row sep -> comma
+    
+    # remove \text{...} wrappers (keeps inner text) and trailing 'degrees' words
+    s = re.sub(r'\\\\text\{([^}]+)\}', r'\\1', s)
+    s = re.sub(r'\\bdegrees?\\b', '', s, flags=re.IGNORECASE)
+    
+    # collapse multiple spaces, then remove space around operators in a conservative way
+    s = re.sub(r'\\s+', ' ', s)
+    s = re.sub(r'\\s*([\\*/\\^=,+\\-])\\s*', r'\\1', s)
+    
+    # normalize simple multiple-choice forms like "(C)" or "\\text{(C)}" -> "C"
+    # match single-letter multiple-choice forms like C or (C)
+    m_choice = re.match(r'^\(?\s*([A-Za-z])\s*\)?$', s.strip())
+    if m_choice:
+        s = m_choice.group(1)
+    
+    # strip outer math wrappers left (one layer) when they are plain parens around the whole expr
+    if s.startswith('(') and s.endswith(')'):
+        # naive one-layer strip (helps when LaTeX wrapped everything in \left( ... \right))
+        inner = s[1:-1].strip()
+        # only strip if parentheses are balanced/simple
+        if inner.count('(') == inner.count(')'):
+            s = inner
+
+        # remove parentheses around numerator/denominator so (a)/(b) -> a/b and (a)/b -> a/b and a/(b) -> a/b
+    s = re.sub(r'\(([^()]+)\)/\(([^()]+)\)', r'\1/\2', s)
+    s = re.sub(r'\(([^()]+)\)/', r'\1/', s)
+    s = re.sub(r'/\(([^()]+)\)', r'/\1', s)
+    # ---- end canonicalization additions ----
+
+    # convert pmatrix/matrix environments into tuple-like output: \begin{pmatrix} a \\\\ b \\end{pmatrix} -> (a,b)
+    if "\\begin{pmatrix}" in s or "\\begin{matrix}" in s:
+        s = s.replace('\\begin{pmatrix}', '(').replace('\\begin{matrix}', '(')
+        s = s.replace('\\end{pmatrix}', ')').replace('\\end{matrix}', ')')
+        # convert LaTeX row separators to commas
+        s = s.replace('\\\\', ',')
+
+    # Normalize simple multiple-choice forms like (C) -> C
+    m_choice = re.match(r"^\(?\s*\(?([A-Za-z])\)?\s*\)?$", s)
+    if m_choice:
+        ch = m_choice.group(1)
+        if len(ch) == 1 and ch.isalpha():
+            s = ch
+        # Remove any remaining LaTeX backslashes left-over (we already handled common constructs)
+    s = s.replace('\\', '')
+    
+    # Fix common leftover 'frac' patterns after braces/backslashes removed:
+    s = re.sub(r'frac\{?\s*([0-9]+)\s*\}\{?\s*([0-9]+)\s*\}?', r'\1/\2', s)   # \frac{5}{9} or frac59
+    s = re.sub(r'frac\{?\s*([^\s\{\}/()]+)\s*\}\{?\s*([^\s\{\}/()]+)\s*\}?', r'\1/\2', s)  # general \frac a b
+    
+    # Normalize stray sequences like '\fracpi2' -> 'pi/2'
+    s = re.sub(r'frac([A-Za-z]+)([0-9]+)', r'\1/\2', s)
+    s = re.sub(r'frac([0-9]+)([A-Za-z]+)', r'\1/\2', s)
+
+        # --- remaining cleanup fixes ---
+    # convert leftover 'frac' patterns into a/b (cover braced, spaced, and glued forms)
+    s = re.sub(r'frac\{([^}]+)\}\{([^}]+)\}', r'(\1)/(\2)', s)
+    s = re.sub(r'frac\s+([^\s\{]+)\s+([^\s\{]+)', r'\1/\2', s)
+    s = re.sub(r'frac([0-9]+)([0-9]+)', r'\1/\2', s)
+    s = re.sub(r'frac([A-Za-z]+)([0-9]+)', r'\1/\2', s)
+    s = re.sub(r'frac([0-9]+)([A-Za-z]+)', r'\1/\2', s)
+    
+    # ensure sequences that ended up like 'a\\-b' or 'a-b' between digits become comma-separated tuples
+    s = re.sub(r'(?<=\d)-(?=\d)', ',-', s)
+    s = re.sub(r'(?<=\d)\s+(?=-?\d)', ',', s)
+        # ensure implied multiplication like '3sqrt(3)' -> '3*sqrt(3)'
+    s = re.sub(r'(?<=\d)(?=sqrt\()', '*', s)
+    s = re.sub(r'(?<=\d)(?=\()', '*', s)
+    
+    # canonicalize top-level fraction wrappers: (num)/(den) -> num/den (preserves nested parentheses)
+    s = _normalize_top_level_frac(s)
+    
+    # normalize a plain '^circ' -> '^\circ' so degree-insensitive code sees it
+    s = s.replace('^circ', '^\\\\circ')
+    
+    # drop any leftover backslashes that are not part of needed LaTeX markers
+    # preserve \circ while removing other stray backslashes
+    s = re.sub(r'\\(?!circ)', '', s)
+    # --- end fixes ---
+    
+    # Remove any leftover duplicate punctuation produced by earlier replacements
+    s = re.sub(r'[,\s]*,[,\s]*', ',', s)
+    s = s.strip()
+    # unescape double-backslashes that often appear when reading JSON-escaped LaTeX
+    s = s.replace('\\\\', '\\')
+
+    # convert simple LaTeX fractions like \frac{a}{b} -> a/b
+    s = re.sub(r"\\frac\{\s*(-?\d+)\s*\}\{\s*(-?\d+)\s*\}", r"\1/\2", s)
+
     s0 = s.strip()
     m = re.match(r"^([-+]?\d+(?:\.\d+)?)(?:\s*[a-zA-Z][a-zA-Z\s\/\-\^]*)$", s0)
     if m:
@@ -290,6 +492,78 @@ def normalize_math_str(s: str) -> str:
 
 
     return s
+
+
+
+def canonicalize_for_embedding(child_text: str) -> str:
+    """
+    Keep a stable semantic signature for math reasoning.
+    (Simple heuristic; safe and cheap.)
+    """
+    text = child_text.strip()
+
+    # Keep first ~2 sentences worth of text
+    # (Avoid huge embedding inputs, reduce boilerplate sensitivity)
+    # Fallback if no periods: first 300 chars
+    parts = text.split(".")
+    head = ".".join(parts[:2]).strip()
+    if len(head) < 20:
+        head = text[:300]
+
+    # Keep a few equation-looking lines
+    eq_lines = []
+    for ln in text.splitlines():
+        s = ln.strip()
+        if not s:
+            continue
+        if "=" in s or "+" in s or "-" in s or "*" in s or "/" in s:
+            eq_lines.append(s)
+        if len(eq_lines) >= 3:
+            break
+
+    ans = extract_answer(text)
+    ans_str = f"\nFINAL_ANS: {ans}" if ans else ""
+
+    eq_block = ("\n" + "\n".join(eq_lines)) if eq_lines else ""
+    return head + eq_block + ans_str
+
+
+def effective_rank_uncertainty(embeddings: list[list[float]]) -> float:
+    """
+    embeddings: B vectors (list of floats)
+    Returns effective rank in [1, B] (approx).
+    """
+    if not embeddings:
+        return 1.0
+
+    E = np.asarray(embeddings, dtype=np.float32)  # (B, d)
+    B = E.shape[0]
+    if B <= 1:
+        return 1.0
+
+    # L2 normalize rows
+    norms = np.linalg.norm(E, axis=1, keepdims=True)
+    norms = np.maximum(norms, 1e-12)
+    E = E / norms
+
+    # Gram matrix (B,B)
+    G = E @ E.T
+
+    # Eigenvalues (symmetric)
+    w = np.linalg.eigvalsh(G)
+    w = np.clip(w, 0.0, None)
+
+    s = float(w.sum())
+    if s <= 1e-12:
+        return 1.0
+
+    p = w / s
+    # Keep only positive mass for stability
+    p = p[p > 1e-12]
+
+    H = -float(np.sum(p * np.log(p)))
+    erank = float(np.exp(H))
+    return float(np.clip(erank, 1.0, float(B)))
 
 class ProblemState:
 
@@ -314,6 +588,7 @@ class ProblemState:
 
         self.agg_f = agg_f
         self.agg_stats = agg_stats
+        self.cfg = cfg
 
         
 
@@ -357,6 +632,24 @@ class ProblemState:
         # Per-iter instrumentation accumulators
         self._last_popped_parent_depths: List[int] = []
         self._expanded_children_this_iter: int = 0
+
+        # --- adaptive depth bonus config ---
+        dbcfg = (cfg.get("dpts_config", {}).get("depth_bonus_adaptive", {}) or {})
+        self.depth_adapt_enabled = bool(dbcfg.get("enabled", False))
+
+        self.alpha_min = float(dbcfg.get("alpha_min", 0.2))
+        self.alpha_max = float(dbcfg.get("alpha_max", 1.0))
+        self.sigmoid_s = float(dbcfg.get("sigmoid_s", 0.15))
+        self.ema_beta = float(dbcfg.get("ema_beta", 0.9))
+        self.anneal_tau = float(dbcfg.get("tau", 3.0))
+
+        # Dynamic alpha (initial)
+        self.alpha_t = float(self.cfg["dpts_config"].get("alpha_depth", 0.8))
+
+        # Uncertainty EMA (initialize to lambda if UAA enabled, else a neutral value)
+        ucfg = (cfg.get("dpts_config", {}).get("uncertainty", {}) or {})
+        self.uaa_lambda = float(ucfg.get("lambda", 1.5))
+        self.U_ema = float(self.uaa_lambda)
         
 
         # State Initialization
@@ -429,6 +722,10 @@ class ProblemState:
         return False
 
     def _depth_bonus_value(self, depth: int) -> float:
+
+        mode = self.cfg["dpts_config"].get("depth_bonus_mode", None)
+        if mode == "until_first_candidate":
+            return float(self.alpha_t) * float(depth)
         if not self._depth_bonus_active():
             return 0.0
         if self.alpha_depth == 0.0:
@@ -484,17 +781,65 @@ class ProblemState:
             self.stop_reason = "frontier_empty"
 
             return True
-
+        '''
         if len(self.cand_ids) >= self.max_candidates:
             self.stop_reason = "budget_candidates"
             return True
+        '''
 
         return False
+
+    def _sigmoid(self, x: float) -> float:
+    # stable sigmoid
+        if x >= 0:
+            z = math.exp(-x)
+            return 1.0 / (1.0 + z)
+        else:
+            z = math.exp(x)
+            return z / (1.0 + z)
+
+    def update_alpha_t(self):
+        """
+        Call once per iteration, before selecting parents.
+        Uses EMA uncertainty + candidate anneal.
+        """
+        if not self.depth_adapt_enabled:
+        # legacy behavior
+            self.alpha_t = float(self.cfg["dpts_config"].get("alpha_depth", 0.8))
+            return
+
+        # 1) Uncertainty-coupled alpha_raw
+        # low U_ema -> more depth pressure
+        x = (self.uaa_lambda - float(self.U_ema)) / max(self.sigmoid_s, 1e-6)
+        gate = self._sigmoid(x)
+
+        alpha_raw = self.alpha_min + (self.alpha_max - self.alpha_min) * gate
+
+        # 2) Candidate anneal
+        if self.candidate_first_found_iter is None:
+            self.alpha_t = alpha_raw
+        else:
+            dt = max(0.0, float(self.iter - self.candidate_first_found_iter))
+            tau = max(self.anneal_tau, 1e-6)
+            self.alpha_t = alpha_raw * math.exp(-dt / tau)
+
+        # clamp
+        self.alpha_t = float(min(max(self.alpha_t, 0.0), self.alpha_max))
 
 
     def get_parents_to_expand(self) -> List[Node]:
 
         """Pops the next batch of parents from the frontier."""
+        # at start of each iteration, before selecting parents
+        self.update_alpha_t()
+        self.log_f.write(json.dumps({
+            "problem_id": self.id,
+            "event": "alpha_update",
+            "iter": self.iter,
+            "alpha_t": self.alpha_t,
+            "U_ema": self.U_ema,
+            "cand_first_found_iter": self.candidate_first_found_iter,
+        }) + "\n")
 
         parents_to_expand = []
 
@@ -729,6 +1074,7 @@ def run_batched_tot(
     batch_problems: int = 10,
     batch_metrics_f=None,
     metrics_url: Optional[str] = None,
+    embedder=None,
 
 ):
 
@@ -778,8 +1124,21 @@ def run_batched_tot(
 
     max_new_tokens=int(lcfg["max_new_tokens"])
 
-    
     return_logprobs = nll_helper.want_logprobs()
+
+    ucfg = (cfg.get("dpts_config", {}).get("uncertainty", {}) or {})
+    uaa_enabled = bool(ucfg.get("enabled", False)) and (embedder is not None)
+    uaa_lambda = float(ucfg.get("lambda", 1.5))
+    uaa_q = int(ucfg.get("q", 2))
+    uaa_canon = bool(ucfg.get("canonicalize", True))
+    uaa_progressive = bool(ucfg.get("progressive", False))
+    uaa_b0 = int(ucfg.get("b0", 2))
+
+    B_full = int(cfg["dpts_config"].get("num_branch", 4))
+    b0 = max(1, min(uaa_b0, B_full))
+
+
+
     # Sampling params (shared)
 
     sampling = dict(
@@ -793,7 +1152,7 @@ def run_batched_tot(
         return_logprobs=return_logprobs,
         logprobs_k=1,
 
-        n=2 
+        n=4 
 
     )
 
@@ -894,6 +1253,8 @@ def run_batched_tot(
                 stales = []
                 prompt_toks = []
                 depths = []
+                probe_U = []
+                need_extra = []
 
 
                 for req_idx, (state, parent_node) in enumerate(request_map):
@@ -916,8 +1277,67 @@ def run_batched_tot(
                 if metrics:
                     pre_t, pre_m = metrics.snapshot()
 
+                # Stage A: probe with n=b0
+                sampling_probe = dict(sampling)
+                sampling_probe["n"] = b0
+                gen_results_probe = backend.generate_batch(batch_prompts, sampling_probe)
+                gen_results = gen_results_probe
+                print("[DEBUG] flags:",
+                "uaa_enabled=", uaa_enabled,
+                "uaa_progressive=", uaa_progressive,
+                "b0=", b0, "B_full=", B_full,
+                "probe_len=", len(gen_results_probe))
 
-                gen_results = backend.generate_batch(batch_prompts, sampling=sampling)
+                if uaa_enabled and uaa_progressive and (b0 < B_full) and gen_results_probe:
+                    need_extra = [False] * len(gen_results_probe)
+                    probe_U = [None] * len(gen_results_probe)
+                    for req_idx, res in enumerate(gen_results_probe):
+                        state, parent_node = request_map[req_idx]
+                        texts_for_embed = []
+                        for t in res.texts:
+                            texts_for_embed.append(canonicalize_for_embedding(t) if uaa_canon else t)
+                        try:
+                            emb_res = embedder.embed(texts_for_embed)
+                            U_hat_probe = effective_rank_uncertainty(emb_res.vectors)
+                        except Exception:
+                            U_hat_probe = None
+
+                        probe_U[req_idx] = U_hat_probe
+                        print(f"[DEBUG] probe U_hat={U_hat_probe} lambda={uaa_lambda} parent={parent_node.node_id}")
+                        if U_hat_probe is None:
+                            need_extra[req_idx] = True
+                        else:
+                            need_extra[req_idx] = (U_hat_probe >= uaa_lambda)
+
+
+                # Stage B: request extra only for those parents
+                extra_n = B_full - b0
+                sampling_extra = dict(sampling)
+                sampling_extra["n"] = extra_n
+                extra_indices = [i for i, flag in enumerate(need_extra) if flag]
+                extra_prompts = [batch_prompts[i] for i in extra_indices]
+                print(f"[DEBUG] progressive: B_full={B_full} b0={b0} extra_n={extra_n} extra_indices={len(extra_indices)} / {len(gen_results_probe)}")
+
+                gen_results_extra = backend.generate_batch(extra_prompts, sampling_extra) if extra_prompts else []
+                gen_results = list(gen_results_probe)  # shallow copy ok; we will create merged GenResult objects below
+                for k, req_idx in enumerate(extra_indices):
+                    probe_res = gen_results_probe[req_idx]
+                    extra_res = gen_results_extra[k]
+                    merged_texts = list(probe_res.texts) + list(extra_res.texts)
+                    merged_lp = None
+                    merged_toks = None
+                    if probe_res.token_logprobs is not None or extra_res.token_logprobs is not None:
+                        merged_lp = (list(probe_res.token_logprobs or []) + list(extra_res.token_logprobs or []))
+                    if probe_res.tokens is not None or extra_res.tokens is not None:
+                        merged_toks = (list(probe_res.tokens or []) + list(extra_res.tokens or []))
+                    merged_time = float(getattr(probe_res, "time_llm_forward_s", 0.0)) + float(getattr(extra_res, "time_llm_forward_s", 0.0))
+                    gen_results[req_idx] = GenResult(
+                            texts=merged_texts,
+                            time_llm_forward_s=merged_time,
+                            token_logprobs=merged_lp,
+                            tokens=merged_toks,
+                        )
+                    print(f"[DEBUG] merged lens sample: {len(gen_results[extra_indices[0]].texts) if extra_indices else 'none'}")
                 any_lp = any((getattr(gr, "token_logprobs", None) is not None) for gr in gen_results) if gen_results else False
                 nll_helper.ensure_or_fallback(any_lp)
 
@@ -1009,24 +1429,20 @@ def run_batched_tot(
                 # Update LLM Time
 
                 state.total_llm_time += res.time_llm_forward_s if hasattr(res, 'time_llm_forward_s') else avg_time
+                child_records = []
+                
 
                 
 
                 for j, child_text in enumerate(res.texts):
-                    lp = None
-                    toks = None
-                    if hasattr(res, "token_logprobs") and res.token_logprobs is not None and j < len(res.token_logprobs):
-                        lp = res.token_logprobs[j]
-                    if hasattr(res, "tokens") and res.tokens is not None and j < len(res.tokens):
-                        toks = res.tokens[j]
 
-                    # Budget Check inside the loop
-
+                    lp = res.token_logprobs[j] if (hasattr(res,"token_logprobs") and res.token_logprobs and j < len(res.token_logprobs)) else None
+                    toks = res.tokens[j] if (hasattr(res,"tokens") and res.tokens and j < len(res.tokens)) else None 
                     if state.total_generated_tokens >= state.max_tokens_global:
-
                         state.stop_reason = "budget_tokens"
-
                         continue
+                    
+
 
 
                     # Count Tokens
@@ -1130,89 +1546,122 @@ def run_batched_tot(
                     
 
                     state.nodes[nid] = new_node
+                    base = new_node.effective_score if (new_node.effective_score is not None) else new_node.prm_score
+                    frontier_score = float(base) + state._depth_bonus_value(new_node.depth)
+                    child_records.append({
+                        "j": j,
+                        "node": new_node,
+                        "frontier_score": frontier_score,
+                        "nll_dbg": nll_dbg,
+                        "solution_so_far": solution_so_far,
+                    })
+                if not child_records:
+                    continue
+                U_hat = None
+                kept = child_records
 
-                    
+                if uaa_enabled:
+                    texts_for_embed = []
+                    for r in child_records:
+                        t = r["node"].completion
+                        texts_for_embed.append(canonicalize_for_embedding(t) if uaa_canon else t)
+                    try:
+                        emb_res = embedder.embed(texts_for_embed)
+                        U_hat = effective_rank_uncertainty(emb_res.vectors)
+                    except Exception as e:
+                        U_hat = None
 
-                    # Push to Frontier
+                    if (U_hat is not None) and (U_hat < uaa_lambda):
+                        kept = sorted(child_records, key=lambda r: r["frontier_score"], reverse=True)[:max(1, uaa_q)]
+                    state.log_f.write(json.dumps({
+                        "problem_id": state.id,
+                        "event": "uaa_uncertainty",
+                        "timestamp": time.time(),
+                        "iter": state.iter,
+                        "parent_id": parent_node.node_id,
+                        "metric": "effective_rank",
+                        "U_hat": U_hat,
+                        "lambda": uaa_lambda,
+                        "q": uaa_q,
+                        "B_eff": len(child_records),
+                        "num_children_total": len(child_records),
+                        "num_children_kept": len(kept),
+                    }) + "\n")
 
-                    heapq.heappush(state.frontier, state.frontier_item_for_node(new_node))
 
-                    
+                    if (U_hat is not None) and state.depth_adapt_enabled:
+                        beta = state.ema_beta
+                        state.U_ema = beta * state.U_ema + (1.0 - beta) * float(U_hat)
 
-                    # Candidate trigger + state transition instrumentation
-                    is_candidate = state._candidate_trigger(child_text) 
-                    #is_candidate = state._candidate_trigger(solution_so_far, gen_toks, max_new_tokens)
+                kept_ids = set(r["node"].node_id for r in kept)
+
+                for r in child_records:
+                    node = r["node"]
+                    nll_dbg = r["nll_dbg"]
+
+                    # Respect UAA pruning first
+                    if node.node_id not in kept_ids:
+                        continue
+
+                    child_text_cur = node.completion
+                    nid_cur = node.node_id
+                    prm_score_cur = node.prm_score
+
+                    # Extract once, reuse everywhere
+                    child_answer = extract_answer(child_text_cur)
+                    is_candidate = bool(child_answer)
+                    # or, if you insist on preserving trigger logic exactly:
+                    # is_candidate = state._candidate_trigger(child_text_cur)
 
                     if is_candidate:
-
-                        state.cand_ids.append(nid)
+                        state.cand_ids.append(nid_cur)
+                        node.is_terminal_candidate = True
 
                         if not state.candidate_found_yet:
-
                             state.candidate_found_yet = True
-
                             state.candidate_first_found_iter = state.iter
-
                             state.candidate_first_found_time = time.time()
 
                             state.log_f.write(json.dumps({
-
                                 "problem_id": state.id,
-
                                 "event": "candidate_first_found",
                                 "timestamp": state.candidate_first_found_time,
-
                                 "iter": state.candidate_first_found_iter,
-
-                                "node_id": nid,
-
-                                "depth": new_node.depth,
-
-                                "prm_score": prm_score,
+                                "node_id": nid_cur,
+                                "depth": node.depth,
+                                "prm_score": prm_score_cur,
                                 **nll_dbg,
-
                                 "num_candidates_total": len(state.cand_ids),
-
                                 "depth_bonus_mode": state.depth_bonus_mode,
-
                                 "alpha_depth": state.alpha_depth,
-
                                 "depth_bonus_cap": state.depth_bonus_cap,
-
                                 "candidate_trigger_mode": state.candidate_trigger_mode,
-
                             }) + "\n")
+                    else:
+                        node.is_terminal_candidate = False
+                        heapq.heappush(state.frontier, state.frontier_item_for_node(node))
+                    
 
-                    # per-iter expansion counter for instrumentation
+                    # per-iter expansion counter for instrumentation 
                     state._expanded_children_this_iter += 1
-                    # Log Expand
+
                     staleness = state.iter - parent_node.created_at_iter
-
-
                     state.log_f.write(json.dumps({
-
                         "problem_id": state.id,
-
                         "event": "expand",
                         "timestamp": time.time(),
-
                         "iter": state.iter,
-
                         "parent_id": parent_node.node_id,
-
-                        "node_id": nid,
-
+                        "node_id": nid_cur,
                         "staleness": staleness,
-
-                        "depth": new_node.depth,
-
-                        "prm_score": prm_score,
+                        "depth": node.depth,
+                        "prm_score": prm_score_cur,
                         **nll_dbg,
-                        "child_completion": child_text,
-                        "child_extract_answer": extract_answer(child_text),
-
-                        "generated_tokens": gen_toks
-
+                        "child_completion": child_text_cur,
+                        "child_extract_answer": child_answer,
+                        "generated_tokens": node.generated_tokens,
+                        "is_candidate": is_candidate,
+                        "pushed_to_frontier": not is_candidate,
                     }) + "\n")
 
 

@@ -24,7 +24,7 @@ BAD_SUBSTRINGS += [
 
 
 FINAL_CUE_RE = re.compile(
-    r"(<<FINAL>>|final\s+answer\s+is|therefore\s*,?\s*the\s+final\s+answer\s+is|answer\s*[:=]|\\boxed\{)",
+    r"(<<FINAL>>|<FINAL>>|<<FINAL>|<FINAL>|final\s+answer\s+is|therefore\s*,?\s*the\s+final\s+answer\s+is|therefore\s*,?\s*the\s+answer\s+is|thus\s*,?\s*the\s+answer\s+is|answer\s*[:=]|\\boxed\{|####)",
     re.IGNORECASE | re.MULTILINE
 )
 
@@ -46,7 +46,15 @@ HASH_RE = re.compile(r"####\s*(.+)$", re.MULTILINE)
 BOX_RE = reg.compile(r"\\boxed\{((?:[^{}]|(?R))*)\}")
 
 
-FINAL_TAG_RE = re.compile(r"(?is)<<FINAL>>\s*(.+?)\s*<</FINAL>>")
+FINAL_TAG_RES = [
+    re.compile(r"(?is)<<FINAL>>\s*(.+?)\s*<</FINAL>>"),
+    re.compile(r"(?is)<FINAL>>\s*(.+?)\s*<</FINAL>>"),
+    re.compile(r"(?is)<<FINAL>\s*(.+?)\s*</FINAL>>"),
+    re.compile(r"(?is)<FINAL>\s*(.+?)\s*</FINAL>"),
+    re.compile(r"(?is)<<FINAL>>\s*(.+?)\s*</FINAL>>"),
+    re.compile(r"(?is)<<FINAL>>\s*(.+?)\s*</FINAL>"),
+    re.compile(r"(?is)<FINAL>>\s*(.+?)\s*</FINAL>"),
+]
 def _has_balanced_braces(s: str) -> bool:
     depth = 0
     for ch in s:
@@ -89,15 +97,29 @@ def looks_terminalish(text: str) -> bool:
 
 
 def extract_answer_final_tag(text: str) -> str:
-    # Only look near the end to avoid random earlier matches
-    tail = "\n".join(text.replace("\\n", "\n").splitlines()[-12:])
-    matches = FINAL_TAG_RE.findall(tail)
-    if not matches:
-        return ""
-    ans = matches[-1].strip()
-    ans = trim_trailing_junk(ans)
-    return ans
+    s = text.replace("\\n", "\n")
 
+    # First: strict search near the end, as before
+    tail = "\n".join(s.splitlines()[-12:])
+    for rx in FINAL_TAG_RES:
+        matches = rx.findall(tail)
+        if matches:
+            ans = matches[-1].strip()
+            ans = trim_trailing_junk(ans)
+            return ans
+
+    # Second: search a small suffix starting at the last FINAL-ish cue
+    cue_matches = list(FINAL_CUE_RE.finditer(s))
+    if cue_matches:
+        region = s[cue_matches[-1].start(): cue_matches[-1].start() + 400]
+        for rx in FINAL_TAG_RES:
+            matches = rx.findall(region)
+            if matches:
+                ans = matches[-1].strip()
+                ans = trim_trailing_junk(ans)
+                return ans
+
+    return ""
 
 def extract_answer_boxed(text: str) -> str:
     """
@@ -156,7 +178,8 @@ def extract_answer(text: str) -> str:
         a = a.strip().rstrip(" .;,")
         if is_plausible_final_answer(a):
             return a
-
+    return ""
+'''
     
 
     # Priority 2: '####' answer
@@ -172,8 +195,8 @@ def extract_answer(text: str) -> str:
         a = a.strip().rstrip(" .;,")
         if is_plausible_final_answer(a):
             return a
-
-    return ""
+'''
+    #return ""
 
 
 ALL_METHODS = ["min_max", "last_max", "majority_vote", "min_vote", "last_vote"]

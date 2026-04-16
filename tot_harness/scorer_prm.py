@@ -16,4 +16,3 @@ class PRMScorer:
         tagged = to_step_tagged(completion, self.step_tag)
         s = self.prm.step_scores(question, tagged)
         return self.prm.aggregate(s, self.aggregation)
-

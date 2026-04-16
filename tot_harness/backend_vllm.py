@@ -33,7 +33,7 @@ class VLLMBackend:
             "prompt": prompts, # <--- SENDING LIST HERE
             "max_tokens": int(sampling.get("max_new_tokens", 100)),
             "temperature": float(sampling.get("temperature", 0.7)),
-            "n": int(sampling.get("n", 1)),
+            "n": int(sampling.get("n", 4)),
         }
 
         if sampling.get("return_logprobs", False):
@@ -45,6 +45,7 @@ class VLLMBackend:
             r = requests.post(url, headers=headers, json=payload, timeout=600)
             r.raise_for_status()
             data = r.json()
+            print("[DEBUG] choices=", len(data.get("choices", [])), "expected=", len(prompts) * payload["n"])
 
         except requests.HTTPError as e:
             print(f"Request Failed: {e}")

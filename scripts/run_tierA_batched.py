@@ -12,7 +12,7 @@ import torch
 import time
 
 from transformers import AutoTokenizer
-
+from tot_harness.embedder_backend import VLLMEmbedder
 
 #from tot_harness.backend_vllm import VLLMBackend
 
@@ -52,11 +52,19 @@ def main():
 
     parser.add_argument("--vllm_url", default="http://127.0.0.1:18000")
 
-    parser.add_argument("--batch_problems", type=int, default=10, help="Concurrent problems")
+    parser.add_argument("--batch_problems", type=int, default=1, help="Concurrent problems")
 
     parser.add_argument("--batch_width", type=int, default=4, help="Nodes per problem per step")
 
     parser.add_argument("--metrics_url", default=None, help="Prometheus /metrics endpoint (e.g. http://127.0.0.1:18000/metrics). ""If not set, will use --vllm_url + '/metrics'.")
+    parser.add_argument("--disable_metrics", action="store_true",help="Disable vLLM /metrics polling (avoid 503 during warmup)")
+    parser.add_argument("--nll_lambda", type=float, default=0.0,
+                        help="Weight for NLL in hybrid priority_mode=prm_nll_hybrid")
+    parser.add_argument("--embed_url", default=None)
+    parser.add_argument("--embed_model", default="BAAI/bge-small-en-v1.5")
+    parser.add_argument("--uaa_enabled", action="store_true")
+    parser.add_argument("--uaa_lambda", type=float, default=1.5)
+    parser.add_argument("--uaa_q", type=int, default=2)
 
     args = parser.parse_args()
 
@@ -90,14 +98,14 @@ def main():
 
             "max_step_time": 480,
 
-            "max_new_tokens": 12000,
+            "max_new_tokens": 8000,
 
             "voting_method": "all",
 
             "num_branch": raw_cfg.get("sampling", {}).get("n", 4),
-            "depth_bonus_mode": "until_first_candidate", "alpha_depth": 0.8, 
+            "depth_bonus_mode": "until_first_candidate", "alpha_depth": 0.0, 
             "priority_mode": "prm_nll_hybrid",
-            "nll_lambda": 0.1,
+            "nll_lambda": args.nll_lambda,
             "nll_norm_mode": "welford_global",
             "nll_token_filter_mode": "math_tokens",
             "logprobs_required": True
@@ -120,6 +128,30 @@ def main():
 
         "dataset": raw_cfg["dataset"]
 
+    }
+    print(f"[CONFIG] nll_lambda={cfg['dpts_config']['nll_lambda']}")
+    print(f"[CONFIG] max_token={cfg['dpts_config']['max_new_tokens']}")
+    cfg["dpts_config"]["uncertainty"] = {
+    "enabled": bool(args.uaa_enabled),
+    "metric": "effective_rank",
+    "lambda": float(args.uaa_lambda),
+    "q": int(args.uaa_q),
+    "canonicalize": True,
+    
+    }
+    #cfg["dpts_config"]["uncertainty"] = raw_cfg.get("dpts_config", {}).get("uncertainty", {})
+    embedder = None
+    if cfg["dpts_config"]["uncertainty"]["enabled"]:
+        embed_url = args.embed_url or args.vllm_url
+        embedder = VLLMEmbedder(base_url=embed_url, model=args.embed_model)
+
+    cfg["dpts_config"]["depth_bonus_adaptive"] = {
+        "enabled": False,
+         "alpha_min": 0.2,
+        "alpha_max": 1.0,
+        "sigmoid_s": 0.15,   # smoothness
+        "ema_beta": 0.9,     # EMA smoothing; 0.9 = slow, stable
+        "tau": 3.0,          # anneal time after first candidate
     }
 
 
@@ -174,16 +206,21 @@ def main():
 
     print(f"Detailed traces will be streamed to: {trace_file_path}")
 
-    metrics_url = args.metrics_url or (args.vllm_url.rstrip("/") + "/metrics")
+    metrics_url = None if args.disable_metrics else (args.metrics_url or (args.vllm_url.rstrip("/") + "/metrics"))
     agg_path = os.path.join(out_dir, f"result_aggregated_{timestamp}.jsonl")
     agg_f = open(agg_path, "w")
     agg_stats = { m: {"total_samples": 0, "correct_samples": 0, "no_match_samples": 0} for m in ALL_METHODS }
-    batch_metrics_path = os.path.join(out_dir, f"batch_metrics_{timestamp}.jsonl")
-    batch_metrics_f = open(batch_metrics_path, "w")
-    print(f"Batch metrics traces will be streamed to: {batch_metrics_path}")
-    print(f"Using metrics URL: {metrics_url}")
-
     
+    batch_metrics_f = None
+
+    if metrics_url is not None:
+        batch_metrics_path = os.path.join(out_dir, f"batch_metrics_{timestamp}.jsonl")
+        batch_metrics_f = open(batch_metrics_path, "w")
+        print(f"Batch metrics traces will be streamed to: {batch_metrics_path}")
+        print(f"Using metrics URL: {metrics_url}")
+    else:
+        print("Metrics disabled (not polling /metrics).")
+        
     #Load Dataset
     TARGET_IDS = [
     "2","5","8","12","13","15","16","22","23","24","26","37","44","51","52",
@@ -200,10 +237,10 @@ def main():
     with open(slice_path) as f:
 
         for line in f:
-            #problems.append(json.loads(line))
-            obj = json.loads(line)
-            if obj.get("id") in TARGET_SET:
-                problems.append(obj)
+            problems.append(json.loads(line))
+            #obj = json.loads(line)
+            #if obj.get("id") in TARGET_SET:
+                #problems.append(obj)
 
 
     # RUN BATCHED SEARCH
@@ -235,6 +272,7 @@ def main():
         batch_problems=args.batch_problems,
         batch_metrics_f=batch_metrics_f,
         metrics_url=metrics_url,
+        embedder=embedder,
 
     )
 
@@ -243,7 +281,10 @@ def main():
     # Close the trace log
 
     log_f.close()
-    batch_metrics_f.close()
+    if batch_metrics_f is not None:
+        batch_metrics_f.close()
+        
+
     
 
     # --- SAVE FINAL SUMMARIES ---
