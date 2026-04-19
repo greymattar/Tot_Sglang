@@ -60,6 +60,10 @@ def main():
     parser.add_argument("--budget_new_tokens", type=int, default=12000,
                     help="Override dpts_config.max_new_tokens for budget sweeps")
 
+    parser.add_argument("--disable_metrics", action="store_true",help="Disable vLLM /metrics polling (avoid 503 during warmup)")
+    parser.add_argument("--embed_url", default=None)
+    parser.add_argument("--embed_model", default="BAAI/bge-small-en-v1.5")
+
     args = parser.parse_args()
 
 
@@ -130,6 +134,13 @@ def main():
             "adaptive_depth_mu_max": 1.0,
             "adaptive_depth_eta_up": 0.1,
             "adaptive_depth_eta_down": 0.05,
+
+            "adaptive_branching_enabled": True,
+            "adaptive_branch_probe_m0": 2,
+            "adaptive_branch_mmax": 4,
+            "adaptive_branch_tau": 1.5,
+            "adaptive_branch_top_r": 2,
+            "adaptive_branch_embed_truncate_chars": 800,
 
 
         },
@@ -282,6 +293,7 @@ def main():
         batch_metrics_f=batch_metrics_f,
         metrics_url=metrics_url,
         verifier=verifier,
+        embedder=embedder,
 
     )
 

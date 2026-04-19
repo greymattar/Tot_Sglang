@@ -534,6 +534,15 @@ class ProblemState:
         self.latest_selected_depth_term = None
         self.adaptive_depth_use_deadband = bool(dcfg.get("adaptive_depth_use_deadband", True))
 
+        # Adaptive branching knobs
+        # -------------------------------
+        self.adaptive_branching_enabled = bool(dcfg.get("adaptive_branching_enabled", False))
+        self.adaptive_branch_probe_m0 = int(dcfg.get("adaptive_branch_probe_m0", 2))
+        self.adaptive_branch_mmax = int(dcfg.get("adaptive_branch_mmax", 4))
+        self.adaptive_branch_tau = float(dcfg.get("adaptive_branch_tau", 1.5))
+        self.adaptive_branch_top_r = int(dcfg.get("adaptive_branch_top_r", 2))
+        self.adaptive_branch_embed_truncate_chars = int(dcfg.get("adaptive_branch_embed_truncate_chars",
+
         # State Initialization
 
         self.t_start = time.time()
@@ -1135,6 +1144,62 @@ class ProblemState:
         pivot = d_ref - delta
         return d_ref, pivot
 
+    def _truncate_for_embedding(text: str, max_chars: int) -> str:
+        text = (text or "").strip()
+        if len(text) <= max_chars:
+            return text
+        return text[:max_chars]
+
+    def _spectral_mode_count(vectors: List[List[float]]) -> float:
+        """
+        Effective semantic mode-count M = exp(H(pi)),
+        where pi is normalized eigen-spectrum of cosine Gram matrix.
+        """
+        if vectors is None or len(vectors) == 0:
+            return 1.0
+        if len(vectors) == 1:
+            return 1.0
+
+        X = np.asarray(vectors, dtype=np.float64)
+        if X.ndim != 2 or X.shape[0] == 0:
+            return 1.0
+
+        # l2 normalize
+        norms = np.linalg.norm(X, axis=1, keepdims=True)
+        norms = np.where(norms <= 1e-12, 1.0, norms)
+        Xn = X / norms
+
+        # cosine Gram
+        G = Xn @ Xn.T
+
+        # eigvals
+        evals = np.linalg.eigvalsh(G)
+        evals = np.clip(evals, 0.0, None)
+
+        s = float(evals.sum())
+        if s <= 1e-12:
+            return 1.0
+
+        pi = evals / s
+        pi = pi[pi > 1e-12]
+        if len(pi) == 0:
+            return 1.0
+
+        H = -np.sum(pi * np.log(pi))
+        M = float(np.exp(H))
+        return max(1.0, min(float(len(vectors)), M))
+
+    def _compute_probe_mode_count(embedder, texts: List[str], max_chars: int) -> float:
+        if embedder is None or texts is None or len(texts) == 0:
+            return 1.0
+
+        clean_texts = [_truncate_for_embedding(t, max_chars) for t in texts]
+        try:
+            emb_res = embedder.embed(clean_texts)
+            return _spectral_mode_count(emb_res.vectors)
+        except Exception:
+            return 1.0
+
     def finalize(self):
 
         """Performs voting, cleanup, and summary logging."""
@@ -1393,6 +1458,7 @@ def run_batched_tot(
     agg_f,
     agg_stats,
     verifier=None,
+    embedder=None,
 
 
     batch_problems: int = 10,
@@ -1594,7 +1660,11 @@ def run_batched_tot(
                         if any(state.candidate_found_yet for state, _ in request_map)
                         else pre_candidate_branch_width
                     )
-                sampling["n"] = phase_branch_width
+                if state.adaptive_branching_enabled:
+                    n_req = state.adaptive_branch_probe_m0
+                else:
+                    n_req = phase_branch_width
+                sampling["n"] = n_req
             
 
 
@@ -1692,9 +1762,42 @@ def run_batched_tot(
 
                 state.total_llm_time += res.time_llm_forward_s if hasattr(res, 'time_llm_forward_s') else avg_time
 
+                probe_texts = list(res.texts)
+                probe_mode_count = 1.0
+
+                if state.adaptive_branching_enabled:
+                    probe_mode_count = _compute_probe_mode_count(
+                        embedder=embedder,
+                        texts=probe_texts,
+                        max_chars=state.adaptive_branch_embed_truncate_chars,
+                    )
+
+                all_texts = list(probe_texts)
+                if state.adaptive_branching_enabled and probe_mode_count >= state.adaptive_branch_tau:
+                    extra_needed = max(0, state.adaptive_branch_mmax - len(probe_texts))
+                    if extra_needed > 0:
+                        extra_prompts = [parent_node.prompt + parent_node.completion]
+                        extra_results = backend.generate_batch(
+                            prompts=extra_prompts,
+                            n=extra_needed,
+                        )
+                        if extra_results and len(extra_results) > 0:
+                            all_texts.extend(extra_results[0].texts)
+
+
+                final_mode_count = probe_mode_count
+                if state.adaptive_branching_enabled:
+                    final_mode_count = _compute_probe_mode_count(
+                        embedder=embedder,
+                        texts=all_texts,
+                        max_chars=state.adaptive_branch_embed_truncate_chars,
+                    )
+
+                parent_child_records = []
+
                 
 
-                for j, child_text in enumerate(res.texts):
+                for j, child_text in enumerate(all_texts):
                     lp = None
                     toks = None
                     if hasattr(res, "token_logprobs") and res.token_logprobs is not None and j < len(res.token_logprobs):
@@ -1813,16 +1916,26 @@ def run_batched_tot(
 
                     state.nodes[nid] = new_node
 
+                     # Candidate trigger + state transition instrumentation
+                    is_candidate = state._candidate_trigger(child_text)
+
+                    rec = {
+                        "node": new_node,
+                        "is_candidate": is_candidate,
+                        "prm_score": prm_score,
+                        "effective_score": eff_score,
+                        "nll_dbg": nll_dbg,
+                        "child_text": child_text,
+                    }
+                    parent_child_records.append(rec)
+
+
                     
 
                     # Push to Frontier
 
                     #heapq.heappush(state.frontier, state.frontier_item_for_node(new_node))
-
                     
-
-                    # Candidate trigger + state transition instrumentation
-                    is_candidate = state._candidate_trigger(child_text) 
                     #is_candidate = state._candidate_trigger(solution_so_far, gen_toks, max_new_tokens)
 
                     if is_candidate:
@@ -1893,8 +2006,6 @@ def run_batched_tot(
                                 "candidate_trigger_mode": state.candidate_trigger_mode,
 
                             }) + "\n")
-                    else: 
-                        heapq.heappush(state.frontier, state.frontier_item_for_node(new_node))
 
                     # per-iter expansion counter for instrumentation
                     state._expanded_children_this_iter += 1
@@ -1927,6 +2038,26 @@ def run_batched_tot(
                         "generated_tokens": gen_toks
 
                     }) + "\n")
+
+                records_to_keep = parent_child_records
+                if state.adaptive_branching_enabled and final_mode_count < state.adaptive_branch_tau:
+                    nonterm = [r for r in parent_child_records if not r["is_candidate"]]
+                    term = [r for r in parent_child_records if r["is_candidate"]]
+
+                    nonterm.sort(
+                        key=lambda r: (
+                            r["effective_score"] if r["effective_score"] is not None else r["prm_score"]
+                        ),
+                        reverse=True
+                    )
+
+                    nonterm = nonterm[:state.adaptive_branch_top_r]
+                    records_to_keep = term + nonterm
+
+                for r in records_to_keep:
+                    if not r["is_candidate"]:
+                        heapq.heappush(state.frontier, state.frontier_item_for_node(r["node"]))
+
 
                 if (not getattr(parent_node, "is_terminal_candidate", False)
                         and parent_node.depth < state.tree_depth
