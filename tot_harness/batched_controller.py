@@ -8,7 +8,7 @@ import json
 import numpy as np
 
 import logging
-
+import statistics
 import time,os
 import re
 import regex as reg
@@ -18,6 +18,7 @@ from typing import List, Dict, Any, Optional
 from tot_harness.grading.robust_grader import extract_final_answer, math_equal, clean_latex
 
 from tot_harness.nll_priority import NLLPriorityHelper
+from tot_harness.backend_vllm import GenResult
 from statistics import mean
 from tot_harness.vllm_metrics import VLLMMetrics, get_hist_delta, get_counter_delta, get_gauge, safe_mean
 from tot_harness.voting import aggregate_one, aggregate_all, ALL_METHODS
@@ -380,6 +381,63 @@ def answers_match(pred: str, ref: str) -> bool:
 
     return False
 
+
+def _truncate_for_embedding(text: str, max_chars: int) -> str:
+    text = (text or "").strip()
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars]
+
+def _spectral_mode_count(vectors: List[List[float]]) -> float:
+    """
+    Effective semantic mode-count M = exp(H(pi)),
+    where pi is normalized eigen-spectrum of cosine Gram matrix.
+    """
+    if vectors is None or len(vectors) == 0:
+        return 1.0
+    if len(vectors) == 1:
+        return 1.0
+
+    X = np.asarray(vectors, dtype=np.float64)
+    if X.ndim != 2 or X.shape[0] == 0:
+        return 1.0
+
+    # l2 normalize
+    norms = np.linalg.norm(X, axis=1, keepdims=True)
+    norms = np.where(norms <= 1e-12, 1.0, norms)
+    Xn = X / norms
+
+    # cosine Gram
+    G = Xn @ Xn.T
+
+    # eigvals
+    evals = np.linalg.eigvalsh(G)
+    evals = np.clip(evals, 0.0, None)
+
+    s = float(evals.sum())
+    if s <= 1e-12:
+        return 1.0
+
+    pi = evals / s
+    pi = pi[pi > 1e-12]
+    if len(pi) == 0:
+        return 1.0
+
+    H = -np.sum(pi * np.log(pi))
+    M = float(np.exp(H))
+    return max(1.0, min(float(len(vectors)), M))
+
+def _compute_probe_mode_count(embedder, texts: List[str], max_chars: int) -> float:
+    if embedder is None or texts is None or len(texts) == 0:
+        return 1.0
+
+    clean_texts = [_truncate_for_embedding(t, max_chars) for t in texts]
+    try:
+        emb_res = embedder.embed(clean_texts)
+        return _spectral_mode_count(emb_res.vectors)
+    except Exception:
+        return 1.0
+
 @dataclass
 
 class Node:
@@ -419,6 +477,8 @@ def _path_ids(nodes: Dict[str, Node], leaf_id: str) -> List[str]:
         cur = nodes[cur].parent_id
 
     return list(reversed(out))
+
+
 
 
 
@@ -541,7 +601,12 @@ class ProblemState:
         self.adaptive_branch_mmax = int(dcfg.get("adaptive_branch_mmax", 4))
         self.adaptive_branch_tau = float(dcfg.get("adaptive_branch_tau", 1.5))
         self.adaptive_branch_top_r = int(dcfg.get("adaptive_branch_top_r", 2))
-        self.adaptive_branch_embed_truncate_chars = int(dcfg.get("adaptive_branch_embed_truncate_chars",
+        self.adaptive_branch_embed_truncate_chars = int(dcfg.get("adaptive_branch_embed_truncate_chars", 800))
+
+
+        self.early_stop_dpts_style_enabled = bool(dcfg.get("early_stop_dpts_style_enabled", False))
+        self.early_stop_t_star = int(dcfg.get("early_stop_t_star", 5))
+        self.early_stop_lambda_es = float(dcfg.get("early_stop_lambda_es", 0.8))
 
         # State Initialization
 
@@ -816,6 +881,9 @@ class ProblemState:
 
             return True
 
+        if self.stop_reason == "early_stop":
+            return True
+
         #if len(self.cand_ids) >= self.max_candidates:
             #self.stop_reason = "budget_candidates"
             #return True
@@ -882,7 +950,8 @@ class ProblemState:
         parents_to_expand = []
         parent_ids_log = []
 
-        width = 4 if not self.candidate_found_yet else self.post_candidate_branch_width
+        #width = 4 if not self.candidate_found_yet else self.post_candidate_branch_width
+        width = 1
 
         # pre-candidate: keep old behavior
         if not self.candidate_found_yet:
@@ -1000,6 +1069,20 @@ class ProblemState:
                             self.adaptive_depth_mu_min,
                             self.adaptive_depth_mu_t - self.adaptive_depth_eta_down
                         )
+
+        if self.candidate_found_yet and self.adaptive_locality_enabled and parents_to_expand:
+            ov = self.latest_selected_overlap
+            if ov is not None and math.isfinite(ov):
+                if ov > self.adaptive_locality_overlap_target:
+                    self.adaptive_locality_lambda_t = min(
+                            self.adaptive_locality_lambda_max,
+                            self.adaptive_locality_lambda_t + self.adaptive_locality_eta_up
+                        )
+                else:
+                    self.adaptive_locality_lambda_t = max(
+                            self.adaptive_locality_lambda_min,
+                            self.adaptive_locality_lambda_t - self.adaptive_locality_eta_down
+                        )
     
 
         if not parents_to_expand:
@@ -1025,6 +1108,7 @@ class ProblemState:
             "candidate_first_found_depth": self.candidate_first_found_depth,
             "latest_selected_depth_term": self.latest_selected_depth_term,
         }
+        self.log_f.flush()
         self.log_f.write(json.dumps(log_entry) + "\n")
 
         return parents_to_expand
@@ -1143,62 +1227,35 @@ class ProblemState:
         delta = max(1, int(math.floor(math.log(d_ref + 1.0))))
         pivot = d_ref - delta
         return d_ref, pivot
+    def should_stop_after_new_candidate(self, candidate_node) -> bool:
+        if not self.early_stop_dpts_style_enabled:
+            return False
 
-    def _truncate_for_embedding(text: str, max_chars: int) -> str:
-        text = (text or "").strip()
-        if len(text) <= max_chars:
-            return text
-        return text[:max_chars]
+        if len(self.cand_ids) < self.early_stop_t_star:
+            return False
 
-    def _spectral_mode_count(vectors: List[List[float]]) -> float:
-        """
-        Effective semantic mode-count M = exp(H(pi)),
-        where pi is normalized eigen-spectrum of cosine Gram matrix.
-        """
-        if vectors is None or len(vectors) == 0:
-            return 1.0
-        if len(vectors) == 1:
-            return 1.0
+        ref_scores = [
+            n.prm_score for n in self.nodes.values()
+            if getattr(n, "times_expanded", 0) > 0 and n.prm_score is not None and math.isfinite(n.prm_score)
+        ]
 
-        X = np.asarray(vectors, dtype=np.float64)
-        if X.ndim != 2 or X.shape[0] == 0:
-            return 1.0
+        if not ref_scores or candidate_node.prm_score is None or not math.isfinite(candidate_node.prm_score):
+            return False
 
-        # l2 normalize
-        norms = np.linalg.norm(X, axis=1, keepdims=True)
-        norms = np.where(norms <= 1e-12, 1.0, norms)
-        Xn = X / norms
+        t = len(self.cand_ids)
 
-        # cosine Gram
-        G = Xn @ Xn.T
+        if t <= self.early_stop_t_star:
+            theta_es = self.early_stop_lambda_es * statistics.mean(ref_scores)
+        else:
+            theta_es = max(ref_scores)
 
-        # eigvals
-        evals = np.linalg.eigvalsh(G)
-        evals = np.clip(evals, 0.0, None)
+        if candidate_node.prm_score < theta_es:
+            self.stop_reason = "early_stop"
+            return True
 
-        s = float(evals.sum())
-        if s <= 1e-12:
-            return 1.0
+        return False
 
-        pi = evals / s
-        pi = pi[pi > 1e-12]
-        if len(pi) == 0:
-            return 1.0
-
-        H = -np.sum(pi * np.log(pi))
-        M = float(np.exp(H))
-        return max(1.0, min(float(len(vectors)), M))
-
-    def _compute_probe_mode_count(embedder, texts: List[str], max_chars: int) -> float:
-        if embedder is None or texts is None or len(texts) == 0:
-            return 1.0
-
-        clean_texts = [_truncate_for_embedding(t, max_chars) for t in texts]
-        try:
-            emb_res = embedder.embed(clean_texts)
-            return _spectral_mode_count(emb_res.vectors)
-        except Exception:
-            return 1.0
+    
 
     def finalize(self):
 
@@ -1318,10 +1375,17 @@ class ProblemState:
         if not use_verifier:
             if triples:
                 from collections import Counter
-                voted_answer = Counter(ans for _, _, ans in triples).most_common(1)[0][0]
-                final_answer = voted_answer
+                norm_map = []  # (cid, txt, raw_ans, norm_ans)
                 for cid, txt, ans in triples:
-                    if ans == voted_answer:
+                    norm_ans = normalize_math_str(ans)
+                    norm_map.append((cid, txt, ans, norm_ans))
+
+                cnt = Counter(norm_ans for _, _, _, norm_ans in norm_map)
+                voted_norm = cnt.most_common(1)[0][0]
+
+                final_answer = voted_norm
+                for cid, txt, ans, norm_ans in norm_map:
+                    if norm_ans == voted_norm:
                         chosen_id = cid
                         final_text = txt
                         break
@@ -1435,6 +1499,7 @@ class ProblemState:
             "verifier": getattr(self, "verifier_debug", None),
 
         }
+        self.log_f.flush()
 
         self.log_f.write(json.dumps({"problem_id": self.id, "event": "summary", **summary}) + "\n")
 
@@ -1576,6 +1641,7 @@ def run_batched_tot(
                 
 
                 # 2. Pop Parents
+            
 
                 parents = state.get_parents_to_expand()
 
@@ -1671,6 +1737,83 @@ def run_batched_tot(
                 gen_results = backend.generate_batch(batch_prompts, sampling=sampling)
                 any_lp = any((getattr(gr, "token_logprobs", None) is not None) for gr in gen_results) if gen_results else False
                 nll_helper.ensure_or_fallback(any_lp)
+                # --- ADAPTIVE BRANCHING: batched extra generation for selected parents ---
+                probe_mode_counts = [1.0] * len(gen_results)
+                extra_needed_per_req = [0] * len(gen_results)
+                extra_indices = []
+
+                if gen_results:
+                    for req_idx, res in enumerate(gen_results):
+                        state_i, parent_node_i = request_map[req_idx]
+
+                        if not state_i.adaptive_branching_enabled:
+                            continue
+
+                        probe_texts_i = list(res.texts)
+                        try:
+                            probe_mode_count_i = _compute_probe_mode_count(
+                                embedder=embedder,
+                                texts=probe_texts_i,
+                                max_chars=state_i.adaptive_branch_embed_truncate_chars,
+                            )
+                        except Exception as e:
+                            #print(f"[DEBUG] probe_mode_count failed for parent={parent_node_i.node_id}: {e}")
+                            probe_mode_count_i = 1.0
+
+                        probe_mode_counts[req_idx] = probe_mode_count_i
+
+                        if probe_mode_count_i >= state_i.adaptive_branch_tau:
+                            extra_needed_i = max(0, state_i.adaptive_branch_mmax - len(probe_texts_i))
+                            if extra_needed_i > 0:
+                                extra_needed_per_req[req_idx] = extra_needed_i
+                                extra_indices.append(req_idx)
+                                #print(f"[DEBUG] adaptive extra candidates={len(extra_indices)} extra_indices={extra_indices}")
+
+                # batched extra generation only if all selected parents need the same extra count
+                # this is the usual case when probe size is fixed and mmax is fixed
+                if extra_indices:
+                    extra_counts = [extra_needed_per_req[i] for i in extra_indices]
+                    same_extra_n = len(set(extra_counts)) == 1
+
+                    if same_extra_n:
+                        extra_n = extra_counts[0]
+                        extra_prompts = [batch_prompts[i] for i in extra_indices]
+
+                        #print(f"[DEBUG] batched extra generation: num_extra_parents={len(extra_indices)} extra_n={extra_n}")
+
+                        extra_sampling = dict(sampling)
+                        extra_sampling["n"] = extra_n
+                        gen_results_extra = backend.generate_batch(extra_prompts, sampling=extra_sampling)
+
+                        gen_results = list(gen_results)
+                        for k, req_idx in enumerate(extra_indices):
+                            probe_res = gen_results[req_idx]
+                            extra_res = gen_results_extra[k]
+
+                            merged_texts = list(probe_res.texts) + list(extra_res.texts)
+                            merged_lp = None
+                            merged_toks = None
+
+                            if getattr(probe_res, "token_logprobs", None) is not None or getattr(extra_res, "token_logprobs", None) is not None:
+                                merged_lp = list(getattr(probe_res, "token_logprobs", None) or []) + \
+                                            list(getattr(extra_res, "token_logprobs", None) or [])
+
+                            if getattr(probe_res, "tokens", None) is not None or getattr(extra_res, "tokens", None) is not None:
+                                merged_toks = list(getattr(probe_res, "tokens", None) or []) + \
+                                            list(getattr(extra_res, "tokens", None) or [])
+
+                            merged_time = float(getattr(probe_res, "time_llm_forward_s", 0.0)) + \
+                                        float(getattr(extra_res, "time_llm_forward_s", 0.0))
+
+                            gen_results[req_idx] = GenResult(
+                                texts=merged_texts,
+                                time_llm_forward_s=merged_time,
+                                token_logprobs=merged_lp,
+                                tokens=merged_toks,
+                            )
+                            #print(f"[DEBUG] merged child counts={[len(r.texts) for r in gen_results]}")
+                    else:
+                        print(f"[DEBUG] adaptive branching skipped batched extra because extra_n differs across parents: {extra_counts}")
 
             except Exception as e:
 
@@ -1763,26 +1906,10 @@ def run_batched_tot(
                 state.total_llm_time += res.time_llm_forward_s if hasattr(res, 'time_llm_forward_s') else avg_time
 
                 probe_texts = list(res.texts)
-                probe_mode_count = 1.0
-
-                if state.adaptive_branching_enabled:
-                    probe_mode_count = _compute_probe_mode_count(
-                        embedder=embedder,
-                        texts=probe_texts,
-                        max_chars=state.adaptive_branch_embed_truncate_chars,
-                    )
-
+                
+                probe_mode_count = probe_mode_counts[req_idx] if req_idx < len(probe_mode_counts) else 1.0
                 all_texts = list(probe_texts)
-                if state.adaptive_branching_enabled and probe_mode_count >= state.adaptive_branch_tau:
-                    extra_needed = max(0, state.adaptive_branch_mmax - len(probe_texts))
-                    if extra_needed > 0:
-                        extra_prompts = [parent_node.prompt + parent_node.completion]
-                        extra_results = backend.generate_batch(
-                            prompts=extra_prompts,
-                            n=extra_needed,
-                        )
-                        if extra_results and len(extra_results) > 0:
-                            all_texts.extend(extra_results[0].texts)
+                
 
 
                 final_mode_count = probe_mode_count
@@ -1946,6 +2073,18 @@ def run_batched_tot(
                         state.latest_candidate_id = nid
                         state.recent_candidate_ids.append(nid)
 
+                        if state.should_stop_after_new_candidate(new_node):
+                            state.log_f.write(json.dumps({
+                                "problem_id": state.id,
+                                "event": "early_stop_triggered",
+                                "iter": state.iter,
+                                "node_id": nid,
+                                "candidate_prm_score": new_node.prm_score,
+                                "num_candidates_total": len(state.cand_ids),
+                                "stop_reason": state.stop_reason,
+                            }) + "\n")
+
+
                         state.pending_escape_from_candidate = True
                         state.escape_candidate_id = nid
                         if len(state.recent_candidate_ids) > state.locality_penalty_recent_k:
@@ -2006,6 +2145,8 @@ def run_batched_tot(
                                 "candidate_trigger_mode": state.candidate_trigger_mode,
 
                             }) + "\n")
+
+
 
                     # per-iter expansion counter for instrumentation
                     state._expanded_children_this_iter += 1

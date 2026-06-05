@@ -12,9 +12,10 @@ import torch
 import time
 
 from transformers import AutoTokenizer
-from src.prm.genprm_verifier import GenPRMVerifier
+#from src.prm.genprm_verifier import GenPRMVerifier
 
 #from tot_harness.backend_vllm import VLLMBackend
+from tot_harness.embedder_backend import VLLMEmbedder
 
 from tot_harness.backend_vllm import VLLMBackend as VLLMBackend
 from tot_harness.batched_controller import run_batched_tot
@@ -52,7 +53,7 @@ def main():
 
     parser.add_argument("--vllm_url", default="http://127.0.0.1:18000")
 
-    parser.add_argument("--batch_problems", type=int, default=10, help="Concurrent problems")
+    parser.add_argument("--batch_problems", type=int, default=15, help="Concurrent problems")
 
     parser.add_argument("--batch_width", type=int, default=4, help="Nodes per problem per step")
 
@@ -61,8 +62,18 @@ def main():
                     help="Override dpts_config.max_new_tokens for budget sweeps")
 
     parser.add_argument("--disable_metrics", action="store_true",help="Disable vLLM /metrics polling (avoid 503 during warmup)")
+    parser.add_argument("--dataset_path", default=None,
+                    help="Override dataset slice_path from config")
     parser.add_argument("--embed_url", default=None)
     parser.add_argument("--embed_model", default="BAAI/bge-small-en-v1.5")
+    parser.add_argument("--model_id", default=None,
+                    help="Override generator model_id from config")
+    parser.add_argument(
+                    "--adaptive_locality_overlap_target",
+                    type=float,
+                    default=0.8,
+                    help="Target overlap for adaptive locality control. Default: 0.8.",
+                )
 
     args = parser.parse_args()
 
@@ -78,6 +89,9 @@ def main():
     # Load raw yaml
 
     raw_cfg = yaml.safe_load(open(config_path))
+    dataset_cfg = raw_cfg["dataset"].copy()
+    if args.dataset_path is not None:
+        dataset_cfg["slice_path"] = args.dataset_path
 
     
 
@@ -94,9 +108,9 @@ def main():
 
             "max_rollout": 20, # Safety limit
 
-            "max_step_time": 480,
+            "max_step_time": 5000,
 
-            "max_new_tokens": int(args.budget_new_tokens) if args.budget_new_tokens is not None else 12000,
+            "max_new_tokens": int(args.budget_new_tokens) if args.budget_new_tokens is not None else 3000,
 
             "voting_method": "all",
 
@@ -128,7 +142,7 @@ def main():
             "adaptive_locality_eta_down": 0.05,
             "adaptive_locality_overlap_target": 0.8,
 
-            "adaptive_depth_enabled": False,
+            "adaptive_depth_enabled": True,
             "adaptive_depth_mu_init": 0.2,
             "adaptive_depth_mu_min": 0.0,
             "adaptive_depth_mu_max": 1.0,
@@ -141,6 +155,10 @@ def main():
             "adaptive_branch_tau": 1.5,
             "adaptive_branch_top_r": 2,
             "adaptive_branch_embed_truncate_chars": 800,
+
+            "early_stop_dpts_style_enabled": False,
+            "early_stop_t_star": 10,
+            "early_stop_lambda_es": 0.8,
 
 
         },
@@ -159,7 +177,7 @@ def main():
 
         "prm": raw_cfg["prm"],
 
-        "dataset": raw_cfg["dataset"]
+        "dataset": dataset_cfg
 
     }
 
@@ -167,11 +185,32 @@ def main():
 
     print(f"[top_m] dpts_config.max_new_tokens={cfg['dpts_config']['max_new_tokens']}")
 
+    overlap_target = float(args.adaptive_locality_overlap_target)
+    cfg["dpts_config"]["adaptive_locality_overlap_target"] = overlap_target
+    print(
+            f"[CONFIG] adaptive_locality_overlap_target={overlap_target} "
+            f"dpts_config={cfg['dpts_config'].get('adaptive_locality_overlap_target')} ",
+            flush=True,
+        )
 
+    embedder = None
+    need_embedder = (
+        cfg["dpts_config"].get("adaptive_branching_enabled", False)
+        or cfg["dpts_config"].get("adaptive_locality_enabled", False)
+    )
+
+    if need_embedder:
+        embed_url = args.embed_url or args.vllm_url
+        embedder = VLLMEmbedder(base_url=embed_url, model=args.embed_model)
+        print(f"[EMBED] enabled url={embed_url} model={args.embed_model}")
+    else:
+        print("[EMBED] disabled")
 
     # Setup Backend (vLLM)
 
-    backend = VLLMBackend(base_url=args.vllm_url, model=raw_cfg["generator"]["model_id"])
+    model_id = args.model_id if args.model_id is not None else raw_cfg["generator"]["model_id"]
+
+    backend = VLLMBackend(base_url=args.vllm_url, model=model_id)
 
 
     # Setup Scorer (PRM)
@@ -210,7 +249,7 @@ def main():
 
     # --- NEW: TOKEN COUNTER ---
 
-    token_counter = SimpleTokenCounter(raw_cfg["generator"]["model_id"])
+    token_counter = SimpleTokenCounter(model_id)
 
 
     # --- NEW: TRACE LOG FILE ---
@@ -231,14 +270,20 @@ def main():
 
     print(f"Detailed traces will be streamed to: {trace_file_path}")
 
-    metrics_url = args.metrics_url or (args.vllm_url.rstrip("/") + "/metrics")
+    metrics_url = None if args.disable_metrics else (args.metrics_url or (args.vllm_url.rstrip("/") + "/metrics"))
+
     agg_path = os.path.join(out_dir, f"result_aggregated_{timestamp}.jsonl")
     agg_f = open(agg_path, "w")
-    agg_stats = { m: {"total_samples": 0, "correct_samples": 0, "no_match_samples": 0} for m in ALL_METHODS }
-    batch_metrics_path = os.path.join(out_dir, f"batch_metrics_{timestamp}.jsonl")
-    batch_metrics_f = open(batch_metrics_path, "w")
-    print(f"Batch metrics traces will be streamed to: {batch_metrics_path}")
-    print(f"Using metrics URL: {metrics_url}")
+    agg_stats = {m: {"total_samples": 0, "correct_samples": 0, "no_match_samples": 0} for m in ALL_METHODS}
+
+    batch_metrics_f = None
+    if not args.disable_metrics:
+        batch_metrics_path = os.path.join(out_dir, f"batch_metrics_{timestamp}.jsonl")
+        batch_metrics_f = open(batch_metrics_path, "w")
+        print(f"Batch metrics traces will be streamed to: {batch_metrics_path}")
+        print(f"Using metrics URL: {metrics_url}")
+    else:
+        print("[METRICS] disabled")
 
     
     #Load Dataset
@@ -302,7 +347,8 @@ def main():
     # Close the trace log
 
     log_f.close()
-    batch_metrics_f.close()
+    if batch_metrics_f is not None:
+        batch_metrics_f.close()
     
 
     # --- SAVE FINAL SUMMARIES ---

@@ -31,3 +31,4 @@ datasets/
 .DS_Store
 .vscode/
 .idea/
+fastTree_polaris_env.sh

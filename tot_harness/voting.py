@@ -156,6 +156,8 @@ def normalize_math_str(s: str) -> str:
     # remove trailing punctuation
     s = re.sub(r"[\.，,;:]+$", "", s)
 
+    return s
+
 def _canon_key(ans: str) -> str:
     """
     Canonical key for voting/dedup.
