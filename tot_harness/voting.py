@@ -22,12 +22,11 @@ BAD_SUBSTRINGS += [
 ]
 
 FINAL_CUE_RE = re.compile(
-    r"(<<FINAL>>|<FINAL>|</FINAL>|"
+    r"(####|<<FINAL>>|<FINAL>|</FINAL>|"      # <-- added ####
     r"final\s+answer\s*(?:is)?\s*[:=]?\s*|"
     r"therefore\s*,?\s*the\s+final\s+answer\s*(?:is)?\s*[:=]?\s*|"
-    r"answer\s*[:=]\s*|"
-    r"\\boxed\{)",
-    re.IGNORECASE | re.MULTILINE
+    r"answer\s*[:=]\s*|\\boxed\{)",
+    re.IGNORECASE | re.MULTILINE,
 )
 
 CUT_RE = re.compile(
@@ -380,6 +379,35 @@ def agg_majority_vote(x_list: List[str], ans_list: List[str], v_list: List[List[
     # should never hit, but safe fallback
     return x_list[triples[0][0]]
 
+def agg_prm_weighted_vote(x_list: List[str], ans_list: List[str], v_list: List[List[float]]) -> str:
+    """PRM-weighted majority vote (a.k.a. weighted self-consistency).
+
+    Each candidate contributes its SCALAR PRM score to its answer group;
+    the group with the highest summed score wins. The flat controller passes
+    v_list[i] = [prm_score_i] (single-element). If a full step-score list is
+    passed instead, we use its last element to stay consistent with last_*.
+    Returns the TEXT of the highest-scoring candidate in the winning group.
+    """
+    groups: Dict[str, float] = {}     # canon answer -> summed weight
+    rep_text: Dict[str, str] = {}     # canon answer -> best representative text
+    rep_w: Dict[str, float] = {}
+    for i, a in enumerate(ans_list):
+        if not a:
+            continue
+        canon = _canon_key(a)
+        if not canon:
+            continue
+        v = v_list[i] if i < len(v_list) else []
+        w = (v[-1] if v else 0.0)
+        w = max(0.0, float(w))        # PRM(min) scores are probabilities; clamp defensively
+        groups[canon] = groups.get(canon, 0.0) + w
+        if canon not in rep_w or w > rep_w[canon]:
+            rep_w[canon] = w
+            rep_text[canon] = x_list[i]
+    if not groups:
+        return agg_prm_last_max(x_list, ans_list, v_list)
+    winner = max(groups.items(), key=lambda kv: kv[1])[0]
+    return rep_text[winner]
 
 def aggregate(voting_method: str, x_list: List[str], v_list: List[List[float]]) -> str:
     ans_list = [extract_answer(x) for x in x_list]
@@ -389,6 +417,9 @@ def aggregate(voting_method: str, x_list: List[str], v_list: List[List[float]]) 
         return agg_prm_last_max(x_list, ans_list, v_list)
     if voting_method in ("prm_min_max", "min_max"):
         return agg_prm_min_max(x_list, ans_list, v_list)
+    if voting_method in ("prm_weighted_vote", "weighted_majority", "prm_weighted_majority"):
+        return agg_prm_weighted_vote(x_list, ans_list, v_list)
+
     # default: majority vote
     return agg_majority_vote(x_list, ans_list, v_list)
 

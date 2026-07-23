@@ -24,6 +24,7 @@ from tot_harness.vllm_metrics import VLLMMetrics, get_hist_delta, get_counter_de
 from tot_harness.voting import aggregate_one, aggregate_all, ALL_METHODS
 from tot_harness.voting import aggregate, extract_answer
 import regex
+from collections import Counter, defaultdict
 from math import isclose
 from sympy import simplify, N
 from sympy.parsing.latex import parse_latex
@@ -479,7 +480,16 @@ def _path_ids(nodes: Dict[str, Node], leaf_id: str) -> List[str]:
     return list(reversed(out))
 
 
-
+def is_bad_child_completion(text: str) -> bool:
+    s = (text or "").strip()
+    if not s:
+        return True
+    if not re.search(r"[A-Za-z0-9]", s):
+        return True
+    # too short to be a meaningful reasoning step
+    if len(s.split()) < 2 and not re.search(r"\d", s):
+        return True
+    return False
 
 
 
@@ -548,6 +558,14 @@ class ProblemState:
         self.candidate_first_found_iter: Optional[int] = None
         self.candidate_first_found_time: Optional[float] = None
         self.post_candidate_branch_width = int(dcfg.get("post_candidate_branch_width", 4))
+        self.branch_width = int(dcfg.get("branch_width", 2))
+
+        self.discover_width = int(dcfg.get("discover_width", self.tree_width))
+        self.diversify_width = int(dcfg.get("diversify_width", self.tree_width))
+        self.discover_branching = int(dcfg.get("discover_branching", self.tree_width))
+        self.diversify_branching = int(dcfg.get("diversify_branching", self.tree_width))
+
+
         self.max_expansions_per_node = int(dcfg.get("max_expansions_per_node", 10))
         self.post_candidate_sampling_enabled = bool(dcfg.get("post_candidate_sampling_enabled", False))
         self.post_candidate_sampling_top_m = int(dcfg.get("post_candidate_sampling_top_m", 5))
@@ -631,11 +649,58 @@ class ProblemState:
 
         self.total_prm_time = 0.0
 
+        self.total_prm_calls = 0
+
+        self.total_prm_chars = 0
+
         self.next_id = 0
 
         self.expanded_children = 0
 
         self.iter = 0
+
+        # -------------------------------
+        # Stage-0 systems diagnostics
+        # -------------------------------
+        self.diag_rounds_total = 0
+        self.diag_rounds_by_phase = {
+            "discover": 0,
+            "diversify": 0,
+        }
+
+        self.diag_parent_requests_total = 0
+        self.diag_parent_requests_by_phase = {
+            "discover": 0,
+            "diversify": 0,
+        }
+
+        self.diag_child_generations_total = 0
+        self.diag_child_generations_by_phase = {
+            "discover": 0,
+            "diversify": 0,
+        }
+
+        self.diag_output_tokens_by_phase = {
+            "discover": 0,
+            "diversify": 0,
+        }
+
+        self.diag_prompt_tokens_by_phase = {
+            "discover": 0,
+            "diversify": 0,
+        }
+
+        self.diag_batch_wall_s_by_phase = {
+            "discover": 0.0,
+            "diversify": 0.0,
+        }
+
+        self.diag_controller_idle_s_by_phase = {
+            "discover": 0.0,
+            "diversify": 0.0,
+        }
+
+        self.diag_max_depth_reached = 0
 
         self.finished = False
 
@@ -945,6 +1010,12 @@ class ProblemState:
         d_min = max(0, d_ref - self.depth_guardrail_delta)
         return node.depth >= d_min
 
+    def current_expand_width(self) -> int:
+        return self.diversify_width if self.candidate_found_yet else self.discover_width
+
+    def current_branching(self) -> int:
+        return self.diversify_branching if self.candidate_found_yet else self.discover_branching
+
 
     def get_parents_to_expand(self) -> List[Node]:
         parents_to_expand = []
@@ -952,6 +1023,9 @@ class ProblemState:
 
         #width = 4 if not self.candidate_found_yet else self.post_candidate_branch_width
         width = 1
+        #width = self.tree_width if not self.candidate_found_yet else self.post_candidate_branch_width
+        #width= self.tree_width
+        #width = self.current_expand_width()
 
         # pre-candidate: keep old behavior
         if not self.candidate_found_yet:
@@ -1011,9 +1085,19 @@ class ProblemState:
                 # log overlap/depth term using the first chosen node only
                 if self.latest_candidate_id is not None and self.latest_candidate_id in self.nodes and chosen:
                     cand_node = self.nodes[self.latest_candidate_id]
-                    first_chosen_node = chosen[0][3]
-                    self.latest_selected_overlap = self._shared_path_fraction(first_chosen_node, cand_node)
-                    self.latest_selected_depth_term = chosen[0][2]
+                    overlaps = [
+                            self._shared_path_fraction(chosen_node, cand_node)
+                            for _, _, _, chosen_node, _ in chosen
+                        ]
+                    depth_terms = [
+                            depth_term
+                            for _, _, depth_term, _, _ in chosen
+                            if depth_term is not None and math.isfinite(depth_term)
+                        ]
+                    self.latest_selected_overlap = ( sum(overlaps) / len(overlaps) if overlaps else None)
+                    self.latest_selected_depth_term = (
+                            sum(depth_terms) / len(depth_terms) if depth_terms else None
+                        )
                 else:
                     self.latest_selected_overlap = None
                     self.latest_selected_depth_term = None
@@ -1035,7 +1119,8 @@ class ProblemState:
 
             if self.adaptive_depth_use_deadband and self.candidate_first_found_depth is not None:
                 d_ref, pivot = self._adaptive_depth_pivot()
-                d_sel = float(selected_node.depth)
+                selected_depth_avg = sum(p.depth for p in parents_to_expand) / len(parents_to_expand)
+                d_sel = float(selected_depth_avg)
 
                 if d_sel < pivot:
                     # too shallow -> push harder
@@ -1108,8 +1193,9 @@ class ProblemState:
             "candidate_first_found_depth": self.candidate_first_found_depth,
             "latest_selected_depth_term": self.latest_selected_depth_term,
         }
-        self.log_f.flush()
+        
         self.log_f.write(json.dumps(log_entry) + "\n")
+        self.log_f.flush()
 
         return parents_to_expand
 
@@ -1495,6 +1581,15 @@ class ProblemState:
             "time_llm_forward_s": float(self.total_llm_time),
 
             "time_prm_s": float(self.total_prm_time),
+            "total_prm_calls": int(self.total_prm_calls),
+            "avg_prm_solution_chars": (
+                float(self.total_prm_chars / self.total_prm_calls)
+                if self.total_prm_calls > 0 else None
+            ),
+            "avg_prm_ms_per_call": (
+                float(1000.0 * self.total_prm_time / self.total_prm_calls)
+                if self.total_prm_calls > 0 else None
+            ),
             "final_method": self.final_method,
             "verifier": getattr(self, "verifier_debug", None),
 
@@ -1506,6 +1601,26 @@ class ProblemState:
         self.summary_data = summary
 
 
+def _search_phase(state) -> str:
+    """
+    Stage-0 phase tag.
+    discover  = before first candidate for this problem
+    diversify = after at least one candidate exists
+    """
+    return "diversify" if bool(getattr(state, "candidate_found_yet", False)) else "discover"
+
+
+def _safe_list_mean(xs):
+    xs = [x for x in xs if x is not None]
+    return float(mean(xs)) if xs else None
+
+
+def _safe_sum_int(xs):
+    return int(sum(int(x) for x in xs if x is not None))
+
+
+def current_branching(self) -> int:
+    return self.diversify_branching if self.candidate_found_yet else self.discover_branching
 
 def run_batched_tot(
 
@@ -1537,8 +1652,13 @@ def run_batched_tot(
     Main controller for Batched Tree-of-Thought.
 
     """
+    inter_batch_idle_s = None
     metrics = VLLMMetrics(metrics_url) if (metrics_url and batch_metrics_f) else None
     batch_id = 0
+    # This measures time between the end of one vLLM generation window
+    # and the start of the next one.
+    last_batch_post_t = None
+    last_batch_id = None
     
 
     # 1. Initialize States
@@ -1581,6 +1701,7 @@ def run_batched_tot(
 
     post_candidate_branch_width = int(dcfg.get("post_candidate_branch_width", 4))
 
+
     
     return_logprobs = nll_helper.want_logprobs()
     # Sampling params (shared)
@@ -1615,6 +1736,7 @@ def run_batched_tot(
             
 
             # --- PHASE 1: SELECTION & COLLECTION ---
+            selection_t0 = time.time()
 
             batch_prompts = []
 
@@ -1686,6 +1808,9 @@ def run_batched_tot(
 
             # --- PHASE 2: GENERATION ---
 
+            selection_t1 = time.time()
+            selection_wall_s = float(selection_t1 - selection_t0)
+
             t0 = time.time()
             
 
@@ -1699,11 +1824,30 @@ def run_batched_tot(
                 stales = []
                 prompt_toks = []
                 depths = []
+                phases = []
+                candidate_counts_before = []
 
 
                 for req_idx, (state, parent_node) in enumerate(request_map):
+                    phase = _search_phase(state)
+
                     st = state.iter - parent_node.created_at_iter
                     pt = token_counter.count_prompt_tokens(batch_prompts[req_idx]) if hasattr(token_counter, "count_prompt_tokens") else None
+                    latest_overlap = None
+                    if (
+                            getattr(state, "latest_candidate_id", None) is not None
+                            and state.latest_candidate_id in state.nodes
+                    ):
+                        try:
+                            latest_overlap = float(
+                                    state._shared_path_fraction(parent_node, state.nodes[state.latest_candidate_id])
+                                )
+                        except Exception:
+                            latest_overlap = None
+
+
+
+
                     req_meta.append({
                         "req_idx": req_idx,
                         "problem_id": state.id,
@@ -1711,9 +1855,26 @@ def run_batched_tot(
                         "depth": parent_node.depth,
                         "staleness": st,
                         "prompt_tokens": pt,
+
+                        "phase": phase,
+                        "candidate_count_before": int(len(state.cand_ids)),
+                        "candidate_found_yet_before": bool(state.candidate_found_yet),
+                        "state_iter_before": int(state.iter),
+                        "state_total_generated_tokens_before": int(state.total_generated_tokens),
+                        "state_rounds_before": int(getattr(state, "diag_rounds_total", 0)),
+                        "state_max_depth_before": int(getattr(state, "diag_max_depth_reached", 0)),
+
+                        "latest_candidate_id_before": getattr(state, "latest_candidate_id", None),
+                        "overlap_with_latest_candidate_before": latest_overlap,
+                        "children_returned": None,
+                        "output_tokens_sum": None,
+                        "output_tokens_mean": None,
+                        "output_tokens_by_child": None,
                     })
                     stales.append(st)
                     depths.append(parent_node.depth)
+                    phases.append(phase)
+                    candidate_counts_before.append(len(state.cand_ids))
                     if pt is not None:
                         prompt_toks.append(pt)
 
@@ -1721,15 +1882,10 @@ def run_batched_tot(
                 if metrics:
                     pre_t, pre_m = metrics.snapshot()
 
-                phase_branch_width = (
-                        post_candidate_branch_width
-                        if any(state.candidate_found_yet for state, _ in request_map)
-                        else pre_candidate_branch_width
-                    )
                 if state.adaptive_branching_enabled:
                     n_req = state.adaptive_branch_probe_m0
                 else:
-                    n_req = phase_branch_width
+                    n_req = state.current_branching()
                 sampling["n"] = n_req
             
 
@@ -1821,6 +1977,29 @@ def run_batched_tot(
 
                 break
 
+            returned_output_tokens_all = []
+            returned_child_counts = []
+
+            for req_idx, res in enumerate(gen_results):
+                state_i, parent_node_i = request_map[req_idx]
+                context_i = parent_node_i.prompt + parent_node_i.completion
+                child_token_counts = []
+                for child_text in list(res.texts):
+                    try:
+                        gt = token_counter.count_generated_tokens_delta(context_i, child_text)
+                    except Exception:
+                        gt = None
+                    child_token_counts.append(gt)
+                clean_child_token_counts = [x for x in child_token_counts if x is not None]
+                returned_child_counts.append(len(list(res.texts)))
+                returned_output_tokens_all.extend(clean_child_token_counts)
+                req_meta[req_idx]["children_returned"] = int(len(list(res.texts)))
+                req_meta[req_idx]["output_tokens_sum"] = int(sum(clean_child_token_counts)) if clean_child_token_counts else 0
+                req_meta[req_idx]["output_tokens_mean"] = float(mean(clean_child_token_counts)) if clean_child_token_counts else 0.0
+                req_meta[req_idx]["output_tokens_by_child"] = [
+                        int(x) if x is not None else None for x in child_token_counts
+                    ]
+
 
             post_t, post_m = (None, None)
             if metrics:
@@ -1839,6 +2018,11 @@ def run_batched_tot(
                 kv_usage = get_gauge(post_m, "vllm:kv_cache_usage_perc", agg="max")
                 n_run = get_gauge(post_m, "vllm:num_requests_running", agg="sum")
                 n_wait = get_gauge(post_m, "vllm:num_requests_waiting", agg="sum")
+                phase_counts = Counter(phases)
+                batch_phase = list(phase_counts.keys())[0] if len(phase_counts) == 1 else "mixed"
+                inter_batch_idle_s = None
+                if last_batch_post_t is not None and pre_t is not None:
+                    inter_batch_idle_s = max(0.0, float(pre_t - last_batch_post_t))
 
 
                 rec = {
@@ -1879,8 +2063,31 @@ def run_batched_tot(
                         "kv_cache_usage_perc_post": kv_usage,
                         "num_requests_running_post": n_run,
                         "num_requests_waiting_post": n_wait,
+
+                        "global_step": int(global_step),
+                        "batch_phase": batch_phase,
+                        "phase_counts": dict(phase_counts),
+                        "num_discover_requests": int(phase_counts.get("discover", 0)),
+                        "num_diversify_requests": int(phase_counts.get("diversify", 0)),
+
+                        "candidate_count_before_mean": float(mean(candidate_counts_before)) if candidate_counts_before else None,
+                        "candidate_count_before_max": int(max(candidate_counts_before)) if candidate_counts_before else None,
+
+                        "selection_wall_s": selection_wall_s,
+                        "inter_batch_idle_s_from_prev": inter_batch_idle_s,
+                        "prev_batch_id": last_batch_id,
+                        "num_parent_requests": int(len(batch_prompts)),
+                        "num_child_generations_returned": int(sum(returned_child_counts)),
+                        "children_returned_mean": float(mean(returned_child_counts)) if returned_child_counts else None,
+                        "returned_output_tokens_sum": int(sum(returned_output_tokens_all)) if returned_output_tokens_all else 0,
+                        "returned_output_tokens_mean": float(mean(returned_output_tokens_all)) if returned_output_tokens_all else None,
+                        "round_budget_proxy_global_batch_id": int(batch_id),
+                        "round_budget_proxy_num_parent_requests": int(len(batch_prompts)),
                     }
                 batch_metrics_f.write(json.dumps(rec) + "\n")
+                batch_metrics_f.flush()
+                last_batch_post_t = post_t
+                last_batch_id = batch_id
 
 
             t1 = time.time()
@@ -1890,6 +2097,12 @@ def run_batched_tot(
             # Attribute time roughly
 
             avg_time = (t1 - t0) / len(batch_prompts) if batch_prompts else 0
+            postprocess_t0 = time.time()
+            batch_prm_time_s = 0.0
+            batch_accepted_output_tokens = 0
+            batch_dead_children = 0
+            batch_new_candidates = 0
+            batch_children_scored = 0
 
 
             # --- PHASE 3: EXPANSION & SCORING ---
@@ -1953,7 +2166,11 @@ def run_batched_tot(
 
                     # Dead Node Check
 
-                    if gen_toks == 0 or not child_text.strip():
+                    if gen_toks == 0 or is_bad_child_completion(child_text):
+                        batch_dead_children += 1
+                        if gen_toks > 0:
+                            state.total_generated_tokens += gen_toks
+
 
                         state.log_f.write(json.dumps({
 
@@ -1965,7 +2182,8 @@ def run_batched_tot(
 
                             "parent_id": parent_node.node_id,
 
-                            "why": "empty_completion"
+                            "why": "empty_or_punctuation_completion",
+                            "child_completion": child_text,
 
                         }) + "\n")
 
@@ -1975,6 +2193,7 @@ def run_batched_tot(
                     state.total_generated_tokens += gen_toks
 
                     state.expanded_children += 1
+                    batch_accepted_output_tokens += int(gen_toks)
 
                     full_text = parent_node.prompt + parent_node.completion + child_text
                    # 2. Extract ONLY the solution steps (remove system prompt)
@@ -1985,22 +2204,27 @@ def run_batched_tot(
                   
 
                     # PRM Scoring
+                    solution_chars = len(solution_so_far or "")
 
                     s0 = time.time()
+
 
                     try:
                         prm_score = float(scorer.score(state.question, solution_so_far))
                     except Exception as e:
                         print(f"Scoring Error: {e}")
                         prm_score = -1.0
+                    score_dt = time.time() - s0
+                    batch_prm_time_s += score_dt
+                    state.total_prm_time += score_dt
+                    state.total_prm_calls += 1
+                    state.total_prm_chars += solution_chars
 
-                
 
                     
 
                     if not math.isfinite(prm_score): prm_score = -1.0
-
-                    state.total_prm_time += (time.time() - s0)
+                    batch_children_scored += 1
                     eff_score, nll_dbg = nll_helper.compute_effective_score(
                             problem_id=state.id,
                             prm_score=prm_score,
@@ -2042,6 +2266,10 @@ def run_batched_tot(
                     
 
                     state.nodes[nid] = new_node
+                    state.diag_max_depth_reached = max(
+                            int(getattr(state, "diag_max_depth_reached", 0)),
+                            int(new_node.depth),
+                        )
 
                      # Candidate trigger + state transition instrumentation
                     is_candidate = state._candidate_trigger(child_text)
@@ -2069,6 +2297,7 @@ def run_batched_tot(
                         new_node.is_terminal_candidate = True
 
                         state.cand_ids.append(nid)
+                        batch_new_candidates += 1
 
                         state.latest_candidate_id = nid
                         state.recent_candidate_ids.append(nid)
@@ -2214,6 +2443,28 @@ def run_batched_tot(
     
 
             unique_states_touched = set(s for s, _ in request_map)
+            # Stage-0 per-state cumulative diagnostics.
+            batch_wall_for_diag = float((post_t - pre_t) if (post_t and pre_t) else (time.time() - t0))
+            per_request_wall_s = batch_wall_for_diag / max(1, len(request_map))
+            for req_idx, (s, parent_node) in enumerate(request_map):
+                phase = req_meta[req_idx]["phase"]
+                out_sum = int(req_meta[req_idx].get("output_tokens_sum") or 0)
+                prompt_tok = req_meta[req_idx].get("prompt_tokens")
+                child_count = int(req_meta[req_idx].get("children_returned") or 0)
+                s.diag_rounds_total += 1
+                s.diag_rounds_by_phase[phase] += 1
+                s.diag_parent_requests_total += 1
+                s.diag_parent_requests_by_phase[phase] += 1
+                s.diag_child_generations_total += child_count
+                s.diag_child_generations_by_phase[phase] += child_count
+                s.diag_output_tokens_by_phase[phase] += out_sum
+                if prompt_tok is not None:
+                    s.diag_prompt_tokens_by_phase[phase] += int(prompt_tok)
+                s.diag_batch_wall_s_by_phase[phase] += float(per_request_wall_s)
+                if inter_batch_idle_s is not None:
+                    s.diag_controller_idle_s_by_phase[phase] += float(
+                            inter_batch_idle_s / max(1, len(request_map))
+                        )
 
             # Per-iteration summary instrumentation (one record per touched state)
             for s in unique_states_touched:
@@ -2250,6 +2501,29 @@ def run_batched_tot(
                     "depth_bonus_cap": s.depth_bonus_cap,
 
                 }) + "\n")
+
+            postprocess_t1 = time.time()
+            if batch_metrics_f:
+                phase_counts_post = Counter([m["phase"] for m in req_meta])
+                post_rec = {
+                        "event": "batch_postprocess_metrics",
+                        "batch_id": int(batch_id),
+                        "global_step": int(global_step),
+                        "batch_phase": list(phase_counts_post.keys())[0] if len(phase_counts_post) == 1 else "mixed",
+                        "phase_counts": dict(phase_counts_post),
+                        "postprocess_wall_s": float(postprocess_t1 - postprocess_t0),
+                        "batch_prm_time_s": float(batch_prm_time_s),
+                        "batch_non_prm_postprocess_s": float((postprocess_t1 - postprocess_t0) - batch_prm_time_s),
+                        "children_scored": int(batch_children_scored),
+                        "accepted_output_tokens_sum": int(batch_accepted_output_tokens),
+                        "dead_children": int(batch_dead_children),
+                        "new_candidates": int(batch_new_candidates),
+                        "touched_problem_ids": [str(s.id) for s in unique_states_touched],
+                    }
+                batch_metrics_f.write(json.dumps(post_rec) + "\n")
+                batch_metrics_f.flush()
+
+
 
             for s in unique_states_touched:
 

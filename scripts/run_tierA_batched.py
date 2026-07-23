@@ -68,12 +68,17 @@ def main():
     parser.add_argument("--embed_model", default="BAAI/bge-small-en-v1.5")
     parser.add_argument("--model_id", default=None,
                     help="Override generator model_id from config")
+    parser.add_argument("--branch_width", type=int, default=2)
     parser.add_argument(
                     "--adaptive_locality_overlap_target",
                     type=float,
                     default=0.8,
                     help="Target overlap for adaptive locality control. Default: 0.8.",
                 )
+    parser.add_argument("--discover_width", type=int, default=None)
+    parser.add_argument("--discover_branching", type=int, default=None)
+    parser.add_argument("--diversify_width", type=int, default=None)
+    parser.add_argument("--diversify_branching", type=int, default=None)
 
     args = parser.parse_args()
 
@@ -82,7 +87,7 @@ def main():
 
     EXP_ROOT = os.environ.get("EXP_ROOT", ".")
 
-    config_path = os.path.join(EXP_ROOT, "configs/contract/dpts_match.yaml")
+    config_path = os.path.join(EXP_ROOT, os.environ.get("PRM_CONFIG", "configs/contract/dpts_match.yaml"))
 
     
 
@@ -114,6 +119,10 @@ def main():
 
             "voting_method": "all",
 
+            "branch_width": args.branch_width,
+            "pre_candidate_branch_width": args.branch_width,
+            "post_candidate_branch_width": args.branch_width,
+
             "num_branch": raw_cfg.get("sampling", {}).get("n", 4),
             "depth_bonus_mode": "until_first_candidate", "alpha_depth": 0.8, 
             "priority_mode": "prm_nll_hybrid",
@@ -121,7 +130,7 @@ def main():
             "nll_norm_mode": "welford_global",
             "nll_token_filter_mode": "math_tokens",
             "logprobs_required": False,
-            "post_candidate_branch_width": 4,
+            "post_candidate_branch_width": 1,
             "max_expansions_per_node": 20,
             "post_candidate_sampling_enabled": False,
             "post_candidate_sampling_top_m": 10,
@@ -159,6 +168,16 @@ def main():
             "early_stop_dpts_style_enabled": False,
             "early_stop_t_star": 10,
             "early_stop_lambda_es": 0.8,
+            "discover_width": args.discover_width if args.discover_width is not None else args.batch_width,
+            "diversify_width": args.diversify_width if args.diversify_width is not None else args.batch_width,
+            "discover_branching": (
+                     args.discover_branching
+                     if args.discover_branching is not None
+                     else args.branch_width
+                    ),
+            "diversify_branching": (args.diversify_branching if args.diversify_branching is not None else args.branch_width ), 
+
+
 
 
         },
@@ -219,13 +238,14 @@ def main():
 
     prm_device = prm_cfg.get("device", "cuda:0")    
     scorer = PRMScorer(
+            backend=prm_cfg.get("backend", "math_shepherd"),
             prm_model_id=prm_cfg["model_id"],
             device=prm_device,
             prm_dtype=prm_cfg["prm_dtype"],
             step_tag=prm_cfg["step_tag"],
             good_token=prm_cfg["good_token"],
             bad_token=prm_cfg["bad_token"],
-            aggregation="last", #tried with min also , try with mean next
+            aggregation=prm_cfg.get("aggregation", "min"),
             mini_step=False,
             #genprm_max_new_tokens=int(prm_cfg.get("genprm_max_new_tokens", 96)),
             #genprm_temperature=float(prm_cfg.get("genprm_temperature", 0.0)),
@@ -256,7 +276,7 @@ def main():
 
     # This file is for the DETAILED step-by-step trace (events like expand, dead_child, etc.)
 
-    out_dir = os.path.join(EXP_ROOT, "runlogs")
+    out_dir = os.environ.get("TOT_OUT_DIR", os.path.join(EXP_ROOT, "runlogs"))
 
     os.makedirs(out_dir, exist_ok=True)
 

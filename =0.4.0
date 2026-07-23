@@ -1,5 +1,0 @@
-Collecting vllm
-  Downloading vllm-0.13.0.tar.gz (17.8 MB)
-     ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 17.8/17.8 MB 18.0 MB/s  0:00:01
-  Installing build dependencies: started
-  Installing build dependencies: finished with status 'error'
